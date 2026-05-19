@@ -1,0 +1,4 @@
+torch>=2.5
+triton>=3.0
+scipy  # optional: Gaussian diagnostic utilities
+pytest>=8
