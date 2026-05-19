@@ -120,7 +120,7 @@ def quest_sparse_attention_decode_gaussian_aware_entmax(
             if tau_mode == "fixed":
                 tau_correction_iters = 0
             else:
-                tau_correction_iters = 1
+                tau_correction_iters = 1 if alibi_slopes is None else 2 
         _gaussian_tau_kernel(
             q=q,
             k_cache=quest_cache.k_cache,

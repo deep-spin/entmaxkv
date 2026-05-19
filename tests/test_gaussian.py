@@ -177,11 +177,25 @@ def test_gaussian_corrected_basic(batch, kv_len, dtype):
     )
     assert result["rel_error"] < 0.5, f"rel_error too large: {result['rel_error']:.4f}"
 
+@pytest.mark.parametrize("dtype", GAUSSIAN_DTYPES, ids=GAUSSIAN_DTYPE_IDS)
+@pytest.mark.parametrize("batch", GAUSSIAN_BATCHES)
+@pytest.mark.parametrize("kv_len", GAUSSIAN_KV_LENS)
+def test_gaussian_corrected_alibi(batch, kv_len, dtype):
+    if not torch.cuda.is_available():
+        return
+    result = run_gaussian_benchmark(
+        seed=12, batch=batch, kv_heads=8, q_heads=8,
+        kv_len=kv_len, head_dim=64, page_size=16,
+        tau_mode="corrected", use_alibi=True,
+        dtype=dtype, device=_device(), print_results=False,
+    )
+    assert result["rel_error"] < 0.5, f"rel_error too large: {result['rel_error']:.4f}"
+
 
 @pytest.mark.parametrize("dtype", GAUSSIAN_DTYPES, ids=GAUSSIAN_DTYPE_IDS)
 @pytest.mark.parametrize("batch", GAUSSIAN_BATCHES)
 @pytest.mark.parametrize("kv_len", GAUSSIAN_KV_LENS)
-def test_gaussian_alibi(batch, kv_len, dtype):
+def test_gaussian_exact_alibi(batch, kv_len, dtype):
     if not torch.cuda.is_available():
         return
     result = run_gaussian_benchmark(

@@ -6,6 +6,13 @@ from entmaxkv.tau_solver import solve_for_tau_hat_single_gaussian
 from entmaxkv.tau_solver_page_mixture import solve_for_tau_hat_page_gaussian_mixture
 
 try:
+    from entmaxkv.tau_mixture_solver_triton import (
+        solve_for_tau_hat_page_gaussian_mixture_triton,
+    )
+except Exception:
+    solve_for_tau_hat_page_gaussian_mixture_triton = None
+
+try:
     from entmaxkv.kernels.gaussian_page_stats import (
         compute_page_gaussian_stats_triton,
     )
@@ -122,9 +129,19 @@ def compute_gaussian_aware_statistics(
             (1, 1, pages_for_stats), float(page_size),
             device=mu_scores_per_page.device, dtype=mu_scores_per_page.dtype,
         )
-        tau_hat = solve_for_tau_hat_page_gaussian_mixture(
-            mu_scores_per_page, sigma_scores_per_page,
-            page_counts=page_counts, alpha=alpha,
+        can_use_triton_tau = (
+            solve_for_tau_hat_page_gaussian_mixture_triton is not None
+            and mu_scores_per_page.is_cuda
+            and sigma_scores_per_page.is_cuda
+            and page_counts.is_cuda
+        )
+        tau_solver = (
+            solve_for_tau_hat_page_gaussian_mixture_triton
+            if can_use_triton_tau
+            else solve_for_tau_hat_page_gaussian_mixture
+        )
+        tau_hat = tau_solver(
+            mu_scores_per_page, sigma_scores_per_page, page_counts=page_counts, alpha=alpha
         )  # [B, H, 1] — squeezed at stats dict assignment below
     else:
         tau_hat = solve_for_tau_hat_single_gaussian(
@@ -228,4 +245,3 @@ def clamp_tau_to_selected_page_statistics(
     if original_shape != clamped.shape:
         clamped = clamped.unsqueeze(-1)
     return clamped.contiguous()
-
