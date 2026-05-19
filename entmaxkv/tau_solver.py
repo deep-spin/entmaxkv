@@ -3,7 +3,7 @@ import math
 from typing import Tuple
 
 try:
-    from entmaxkv.tau_solver_gpu import solve_for_tau_hat_single_gaussian_gpu
+    from entmaxkv.kernels.tau_solver_gpu import solve_for_tau_hat_single_gaussian_gpu
     _HAS_GPU_SOLVER = True
 except Exception:
     solve_for_tau_hat_single_gaussian_gpu = None

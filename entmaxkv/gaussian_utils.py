@@ -3,10 +3,10 @@ import torch
 from typing import Tuple
 
 from entmaxkv.tau_solver import solve_for_tau_hat_single_gaussian
-from entmaxkv.tau_solver_page_mixture import solve_for_tau_hat_page_gaussian_mixture
+from entmaxkv.kernels.tau_solver_page_mixture import solve_for_tau_hat_page_gaussian_mixture
 
 try:
-    from entmaxkv.tau_mixture_solver_triton import (
+    from entmaxkv.kernels.tau_mixture_solver_triton import (
         solve_for_tau_hat_page_gaussian_mixture_triton,
     )
 except Exception:
