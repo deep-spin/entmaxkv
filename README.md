@@ -2,7 +2,7 @@
 
 Sparse entmax attention for efficient LLM inference with page-based KV cache compression.
 
-During autoregressive decoding, attending over the full KV cache grows expensive as context length increases. EntmaxKV compresses this cost by selecting only the most relevant pages of cached tokens—using entmax (a sparse generalization of softmax) with two selection strategies: **top-k** page scoring and **Gaussian-aware** distributional selection.
+During autoregressive decoding, attending over the full KV cache grows expensive as context length increases. EntmaxKV reduces memory movement by selecting the most relevant tokens with two selection strategies: **top-k** page scoring and **Gaussian-aware** distributional selection.
 
 ## How it works
 
@@ -67,52 +67,6 @@ quest_sparse_attention_decode_gaussian_aware_entmax(
 )
 ```
 
-## API
-
-### `QuestKVCache`
-
-Page-based KV cache with incremental statistics.
-
-```python
-cache = QuestKVCache(page_size=16)
-cache.initialize(k, v)          # called once after prefill
-cache.append(k_new, v_new)      # called each decode step (if append_cache=False)
-```
-
-Maintains per-page `k_min`, `k_max`, `k_mean`, `k_std` for fast criticality scoring. Supports GQA (grouped-query attention) and ALiBi positional biases.
-
-### `quest_sparse_attention_decode_paged`
-
-Top-k sparse attention decode.
-
-| Argument | Description |
-|---|---|
-| `q` | Query `[B, H, 1, D]` |
-| `quest_cache` | `QuestKVCache` instance |
-| `k_new`, `v_new` | Current-step keys/values `[B, H, 1, D]` |
-| `out` | Output buffer `[B, H, 1, D]` |
-| `token_budget` | Max tokens to attend over |
-| `cache_seqlens` | Sequence lengths `[B]` |
-| `q_seqlens` | Query lengths `[B]` |
-| `alpha` | Entmax alpha (1.5 or 2.0) |
-| `alibi_slopes` | Optional ALiBi slopes `[H]` |
-| `append_cache` | Whether to update cache with `k_new`/`v_new` |
-
-### `quest_sparse_attention_decode_gaussian_aware_entmax`
-
-Gaussian-aware entmax decode. Same signature as above, replacing `token_budget` with:
-
-| Argument | Description |
-|---|---|
-| `alpha` | Entmax alpha (1.5 or 2.0) |
-| `tau_mode` | `"exact"` \| `"fixed"` \| `"corrected"` |
-| `n_newton_steps` | Newton refinement steps when `tau_mode="corrected"` |
-| `clamp_tau` | Clamp τ to selected pages (reduces over-selection) |
-
-**`tau_mode` options:**
-- `"exact"` — solve for τ per query during decode (most accurate, slower)
-- `"fixed"` — use Gaussian τ estimate directly (fastest)
-- `"corrected"` — Gaussian estimate + Newton refinement steps (balanced)
 
 ## Repository layout
 
