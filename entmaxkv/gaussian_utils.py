@@ -178,9 +178,45 @@ def clamp_tau_to_selected_page_statistics(
     eps: float = 1.0e-4,
 ) -> "torch.Tensor":
     """
-    We need to make sure tau is not overestimated before it reaches the kernel
-    Otherwise we exclude valid tokens from the support
-    WIP
+    Clamp tau downward so it cannot exceed a per-head upper bound derived from the
+    selected pages, preventing valid tokens from being zeroed out by the entmax mask.
+
+    The upper bound for each head is:
+
+        tau_stat_upper = (alpha - 1) * page_cap_max - eps
+
+    where page_cap_max is the maximum, over selected pages, of a score quantile:
+
+        page_cap[p] = mu[p] + z_clamp * sigma[p] / 3
+
+    and z_clamp is the normal quantile corresponding to `clamp_quantile` raised to
+    the power 1/page_size (treating page membership as independent Bernoulli draws).
+    This cap estimates the highest score a token in the selected pages is likely to
+    attain; (alpha-1)*cap is therefore the largest tau that still keeps at least one
+    token in the entmax support.
+
+    If `tau_floor` is provided it acts as a lower bound on the clamped value, ensuring
+    tau does not drop below a minimum useful threshold.
+
+    Args:
+        tau: Threshold tensor, shape [B, H] or [B, H, 1].
+        gaussian_stats: Dict with keys:
+            - mu_scores_per_page:  [B, H, n_pages] per-page score means.
+            - sigma_scores_per_page: [B, H, n_pages] per-page score std devs.
+            - pages_for_stats: int, number of pages that carry valid statistics.
+            - tau_clamp_page_max_quantile: float, target per-page max quantile
+              (default 0.50).
+            - tau_floor: optional lower bound tensor, same shape as tau.
+        page_indices: [B, H, k] indices of the k selected pages per head.
+        num_selected_per_head: [B, H] number of valid entries in page_indices.
+        page_size: Number of tokens per page (used to convert page quantile to
+            per-token quantile).
+        alpha: Entmax alpha parameter.
+        eps: Small margin subtracted from the upper bound so the boundary token
+            is kept strictly in the support.
+
+    Returns:
+        Clamped tau, same shape as the input tau.
     """
     if tau is None:
         return tau
