@@ -3,20 +3,23 @@ from typing import Optional
 
 import torch
 
-from entmaxkv.kernels.adadecode_paged import quest_sparse_attention_decode_paged as _paged_kernel
+from entmaxkv.kernels.adadecode_paged import sparse_attention_decode_paged as _paged_kernel
 from entmaxkv.kernels.adadecode_paged_gaussian_tau import (
-    quest_sparse_attention_decode_paged_gaussian_tau as _gaussian_tau_kernel,
+    sparse_attention_decode_paged_gaussian_tau as _gaussian_tau_kernel,
 )
 from entmaxkv.gaussian_utils import (
     clamp_tau_to_selected_page_statistics,
     compute_gaussian_aware_statistics,
 )
-from entmaxkv.kv_cache import QuestKVCache
+from entmaxkv.kernels.selection_pack import (
+    cache_seqlens_from_page_counts_triton,
+)
+from entmaxkv.kv_cache import PagedKVCache
 
 
-def quest_sparse_attention_decode_gaussian_aware_entmax(
+def sparse_attention_decode_gaussian_aware_entmax(
     q: torch.Tensor,
-    quest_cache: QuestKVCache,
+    kv_cache: PagedKVCache,
     k_new: torch.Tensor,
     v_new: torch.Tensor,
     out: torch.Tensor,
@@ -27,11 +30,11 @@ def quest_sparse_attention_decode_gaussian_aware_entmax(
     scale: Optional[float] = None,
     splits: int = 32,
     niter: int = 2,
-    append_cache: bool = True,
-    tau_mode: str = "exact",
+    append_cache: bool = False,
+    tau_mode: str = "corrected",
     tau_correction_iters: Optional[int] = None,
     clamp_tau: bool = True,
-    threshold_excess_margin_fraction: Optional[float] = 0.1,
+    threshold_excess_margin_fraction: Optional[float] = 0.2,
     tau_clamp_page_max_quantile: float = 0.50,
     q_seqlens: torch.Tensor = None,
 ):
@@ -53,10 +56,10 @@ def quest_sparse_attention_decode_gaussian_aware_entmax(
         scale = 1.0 / math.sqrt(head_dim)
 
     if append_cache:
-        quest_cache.append(k_new, v_new)
+        kv_cache.append(k_new, v_new)
 
-    seq_len   = quest_cache.k_cache.shape[2]
-    page_size = quest_cache.page_size
+    seq_len   = kv_cache.k_cache.shape[2]
+    page_size = kv_cache.page_size
 
     tau_mode = tau_mode.lower()
     if tau_mode not in ("exact", "fixed", "corrected"):
@@ -64,17 +67,17 @@ def quest_sparse_attention_decode_gaussian_aware_entmax(
     needs_tau = tau_mode != "exact"
     gaussian_stats = compute_gaussian_aware_statistics(
         q=q,
-        k_mean=quest_cache.k_mean,
-        k_std=quest_cache.k_std,
-        seq_len=quest_cache.k_cache.shape[2],
-        page_size=quest_cache.page_size,
+        k_mean=kv_cache.k_mean,
+        k_std=kv_cache.k_std,
+        seq_len=kv_cache.k_cache.shape[2],
+        page_size=kv_cache.page_size,
         alpha=alpha,
         alibi_slopes=alibi_slopes,
         threshold_excess_margin_fraction=threshold_excess_margin_fraction,
         tau_clamp_page_max_quantile=tau_clamp_page_max_quantile,
     )
 
-    raw, num_selected_per_head = quest_cache.select_gaussian_aware(
+    raw, num_selected_per_head = kv_cache.select_gaussian_aware(
         q, alpha=alpha, safety_margin_z=safety_margin_z, max_quantile=max_quantile,
         gaussian_stats=gaussian_stats,
     )
@@ -94,16 +97,17 @@ def quest_sparse_attention_decode_gaussian_aware_entmax(
 
     # cache_seqlens [B, H_kv]: compacted token count per head.
     last_page_size = seq_len - (math.ceil(seq_len / page_size) - 1) * page_size if seq_len > page_size else seq_len
-    selected_tokens_per_head = (
-        torch.clamp(num_selected_per_head - 1, min=0) * page_size + last_page_size
+    cache_seqlens = cache_seqlens_from_page_counts_triton(
+        num_selected_per_head,
+        page_size,
+        last_page_size,
     )
-    cache_seqlens = selected_tokens_per_head.to(torch.int32)  # [B, H]
 
     if tau_mode == "exact":
         _paged_kernel(
             q=q,
-            k_cache=quest_cache.k_cache,
-            v_cache=quest_cache.v_cache,
+            k_cache=kv_cache.k_cache,
+            v_cache=kv_cache.v_cache,
             out=out,
             cache_seqlens=cache_seqlens,
             page_indices=page_indices,
@@ -123,8 +127,8 @@ def quest_sparse_attention_decode_gaussian_aware_entmax(
                 tau_correction_iters = 1 if alibi_slopes is None else 2 
         _gaussian_tau_kernel(
             q=q,
-            k_cache=quest_cache.k_cache,
-            v_cache=quest_cache.v_cache,
+            k_cache=kv_cache.k_cache,
+            v_cache=kv_cache.v_cache,
             out=out,
             cache_seqlens=cache_seqlens,
             page_indices=page_indices,

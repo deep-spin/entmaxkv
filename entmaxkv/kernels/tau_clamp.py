@@ -109,7 +109,9 @@ def clamp_tau_to_selected_page_statistics_triton(
         out = tau_c.clone()
         return out.unsqueeze(-1) if original_shape != out.shape else out
 
-    block_slots = triton.next_power_of_2(max_slots)
+    # The mandatory last-page sentinel carries no Gaussian statistics and is
+    # appended after all statistical pages, so it does not need a scan lane.
+    block_slots = triton.next_power_of_2(min(max_slots, pages_for_stats))
     per_sample_prob = clamp_quantile ** (1.0 / page_size)
     z_clamp = NormalDist().inv_cdf(per_sample_prob)
 

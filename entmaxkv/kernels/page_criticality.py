@@ -85,10 +85,13 @@ def _page_criticality_kernel(
             kmax_ptrs = kmax_base + page_offsets[:, None] * stride_kp + d_offsets[None, :] * stride_kd
             load_mask = page_mask[:, None] & d_mask[None, :]
 
-            kmin_chunk = tl.load(kmin_ptrs, mask=load_mask, other=0.0).to(tl.float32)
-            kmax_chunk = tl.load(kmax_ptrs, mask=load_mask, other=0.0).to(tl.float32)
-
-            upper = tl.maximum(q_chunk[None, :] * kmin_chunk, q_chunk[None, :] * kmax_chunk)
+            # max(q*k_min, q*k_max) needs only one bound: k_max for a
+            # non-negative q component and k_min for a negative one. Select
+            # the address before loading to halve metadata traffic while
+            # preserving the exact arithmetic used for the chosen product.
+            bound_ptrs = tl.where(q_chunk[None, :] >= 0.0, kmax_ptrs, kmin_ptrs)
+            bound = tl.load(bound_ptrs, mask=load_mask, other=0.0).to(tl.float32)
+            upper = q_chunk[None, :] * bound
             acc += tl.sum(upper, axis=1)
 
         acc = acc * scale
@@ -110,6 +113,7 @@ def triton_estimate_page_criticality(
     q_pos: int = 0,
     page_size: int = 16,
     seq_len: int = 0,
+    exclude_last_page: bool = False,
 ) -> torch.Tensor:
     """
     Triton-accelerated page criticality estimation.
@@ -130,18 +134,25 @@ def triton_estimate_page_criticality(
         q_pos: absolute position of the query token (seq_len - 1).
         page_size: tokens per page.
         seq_len: full sequence length (used to clamp page_last_pos).
+        exclude_last_page: drop the in-progress last page from scoring.
 
     Returns:
         page_scores: [batch, num_heads, num_pages]
     """
     batch, num_heads, _, head_dim = q.shape
-    _, num_kv_heads, num_pages, _ = k_min.shape
+    _, num_kv_heads, stored_pages, _ = k_min.shape
+    num_pages = stored_pages - int(exclude_last_page)
+    if num_pages < 0:
+        raise ValueError("cannot exclude the last page from an empty cache")
     gqa_group = num_heads // num_kv_heads
     scale = 1.0 / math.sqrt(head_dim) if apply_scaling else 1.0
 
     q = q.contiguous()
     k_min = k_min.contiguous()
     k_max = k_max.contiguous()
+
+    if num_pages == 0:
+        return torch.empty(batch, num_heads, 0, device=q.device, dtype=q.dtype)
 
     has_alibi = alibi_slopes is not None
     if has_alibi:

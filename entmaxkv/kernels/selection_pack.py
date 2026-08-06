@@ -5,6 +5,45 @@ from statistics import NormalDist
 
 
 @triton.jit
+def _cache_seqlens_from_page_counts_kernel(
+    COUNTS,
+    CACHE_SEQLENS,
+    numel,
+    page_size: tl.constexpr,
+    last_page_size,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < numel
+    counts = tl.load(COUNTS + offsets, mask=mask, other=0).to(tl.int32)
+    cache_len = tl.maximum(counts - 1, 0) * page_size + last_page_size
+    tl.store(CACHE_SEQLENS + offsets, cache_len, mask=mask)
+
+
+def cache_seqlens_from_page_counts_triton(
+    counts: torch.Tensor,
+    page_size: int,
+    last_page_size: int,
+) -> torch.Tensor:
+    """Convert selected-page counts to valid token counts in one launch."""
+    if not counts.is_cuda:
+        raise ValueError("Triton cache-seqlens conversion requires a CUDA tensor")
+    counts_c = counts.contiguous()
+    out = torch.empty_like(counts_c, dtype=torch.int32)
+    block = 128
+    _cache_seqlens_from_page_counts_kernel[(triton.cdiv(counts_c.numel(), block),)](
+        counts_c,
+        out,
+        counts_c.numel(),
+        page_size=page_size,
+        last_page_size=last_page_size,
+        BLOCK=block,
+        num_warps=1,
+    )
+    return out
+
+
+@triton.jit
 def _pack_page_mask_kernel(
     PAGE_MASK,
     OUT,
@@ -107,8 +146,6 @@ def _select_gaussian_threshold_pack_kernel(
 
     offsets = tl.arange(0, BLOCK_PAGES)
     stats_valid = offsets < pages_for_stats
-    page_valid = offsets < num_pages
-    is_last_page = (offsets == (num_pages - 1)) & (num_pages > 1)
 
     mu = tl.load(
         MU_PAGE + batch_id * stride_mb + head_id * stride_mh + offsets * stride_mp,
@@ -136,17 +173,29 @@ def _select_gaussian_threshold_pack_kernel(
     tl.store(TAU_FLOOR + batch_id * stride_fb + head_id * stride_fh, tau_floor)
 
     s_bar = mu + z_page * sigma
-    selected = page_valid & ((alpha_minus_one * s_bar > tau_floor) | is_last_page)
+    selected = stats_valid & (alpha_minus_one * s_bar > tau_floor)
     selected_i32 = selected.to(tl.int32)
     ranks = tl.cumsum(selected_i32, axis=0) - 1
-    count = tl.sum(selected_i32, axis=0)
+    stats_count = tl.sum(selected_i32, axis=0)
 
-    tl.store(COUNTS + batch_id * stride_cb + head_id * stride_ch, count)
     tl.store(
         OUT + batch_id * stride_ob + head_id * stride_oh + ranks * stride_op,
         offsets,
         mask=selected,
     )
+
+    # The in-progress final page is mandatory but has no statistics. Appending
+    # it separately avoids rounding 2,049 pages up to a 4,096-lane scan at the
+    # common 32k + one decode-token boundary.
+    if num_pages > pages_for_stats:
+        tl.store(
+            OUT + batch_id * stride_ob + head_id * stride_oh + stats_count * stride_op,
+            num_pages - 1,
+        )
+        count = stats_count + 1
+    else:
+        count = stats_count
+    tl.store(COUNTS + batch_id * stride_cb + head_id * stride_ch, count)
 
 
 def select_gaussian_threshold_pack_triton(
@@ -185,7 +234,7 @@ def select_gaussian_threshold_pack_triton(
     counts = torch.empty((batch, num_heads), dtype=torch.int32, device=mu_c.device)
     tau_floor = torch.empty((batch, num_heads), dtype=torch.float32, device=mu_c.device)
 
-    block_pages = triton.next_power_of_2(num_pages)
+    block_pages = triton.next_power_of_2(pages_for_stats)
     per_sample_prob = max_quantile ** (1.0 / page_size)
     z_page = NormalDist().inv_cdf(per_sample_prob)
 

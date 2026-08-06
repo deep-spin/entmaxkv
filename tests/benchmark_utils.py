@@ -22,9 +22,13 @@ from entmaxkv.kernels.triton_entmax import triton_entmax
 # ---------------------------------------------------------------------------
 
 def generate_alibi_slopes(n_heads: int, dtype=torch.float32) -> torch.Tensor:
+    """Half the heads get linear ALiBi slopes, the other half get slope 0 (NoPE)."""
+    assert n_heads % 2 == 0, "n_heads must be even for NAPE (ALiBi + NoPE) slopes"
+    half = n_heads // 2
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    slopes = torch.exp2(-8 * torch.arange(1, n_heads + 1, device=device) / n_heads).to(dtype)
-    return slopes
+    alibi_half = torch.exp2(-8 * torch.arange(1, half + 1, device=device) / half).to(dtype)
+    nope_half = torch.zeros(half, device=device, dtype=dtype)
+    return torch.cat([alibi_half, nope_half])
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +61,7 @@ def reference_attention(
     alibi_slopes: torch.Tensor = None,
     niter: int = 2,
 ) -> torch.Tensor:
-    """Dense PyTorch attention reference matching adaquest's chunked reference."""
+    """Dense PyTorch attention reference matching the chunked kernel reference."""
     batch, num_heads, q_len, head_dim = q.shape
     kv_len = k.shape[2]
     q_f = q.float()

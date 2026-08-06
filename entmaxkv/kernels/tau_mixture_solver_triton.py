@@ -90,6 +90,7 @@ def _tau_hat_page_mixture_kernel(
     iterations: tl.constexpr,
     tol: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    UNIFORM_PAGE_COUNT: tl.constexpr,
     BLOCK_PAGES: tl.constexpr,
 ):
     row = tl.program_id(0)
@@ -106,7 +107,7 @@ def _tau_hat_page_mixture_kernel(
         counts_raw = tl.load(PAGE_COUNTS + base, mask=page_mask, other=0.0).to(tl.float32)
         counts = tl.where(page_mask, counts_raw, 0.0)
     else:
-        counts = tl.where(page_mask, 1.0, 0.0)
+        counts = tl.where(page_mask, UNIFORM_PAGE_COUNT, 0.0)
 
     active = counts > 0.0
     has_active = tl.sum(tl.where(active, 1.0, 0.0), axis=0) > 0.0
@@ -175,6 +176,7 @@ def solve_for_tau_hat_page_gaussian_mixture_triton(
     alpha: float = 1.5,
     max_iter: int = 40,
     tol: float = 1e-6,
+    uniform_page_count: float = 1.0,
 ) -> torch.Tensor:
     """
     Triton-parallel page-mixture tau solver.
@@ -195,6 +197,8 @@ def solve_for_tau_hat_page_gaussian_mixture_triton(
         raise ValueError("Triton page-mixture tau solve requires CUDA tensors")
     if alpha not in (2, 1.5, 4 / 3):
         raise ValueError(f"Unsupported alpha for page-mixture tau solve: {alpha}")
+    if uniform_page_count <= 0:
+        raise ValueError("uniform_page_count must be positive")
 
     pages = mu_pages.shape[-1]
     if pages <= 0:
@@ -228,6 +232,7 @@ def solve_for_tau_hat_page_gaussian_mixture_triton(
         max_iter,
         float(tol),
         HAS_COUNTS=has_counts,
+        UNIFORM_PAGE_COUNT=float(uniform_page_count),
         BLOCK_PAGES=block_pages,
         num_warps=num_warps,
     )

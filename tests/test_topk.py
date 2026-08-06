@@ -1,5 +1,5 @@
 """
-Benchmark: Quest top-k sparse attention decode (paged kernel).
+Benchmark: top-k sparse attention decode (paged kernel).
 
 Run with:
     python tests/test_topk.py
@@ -18,8 +18,8 @@ from tests.benchmark_utils import (
 )
 
 
-from entmaxkv.kv_cache import QuestKVCache
-from entmaxkv.attention_topk import quest_sparse_attention_decode_paged
+from entmaxkv.kv_cache import PagedKVCache
+from entmaxkv.attention_topk import sparse_attention_decode_paged
 
 
 TOPK_BATCHES = [1, 8]
@@ -87,7 +87,7 @@ def run_topk_benchmark(
     out = torch.zeros_like(q)
 
     def make_fresh_cache():
-        c = QuestKVCache(page_size=page_size)
+        c = PagedKVCache(page_size=page_size)
         c.initialize(k_full, v_full)
         c.append(k_new, v_new)
         return c
@@ -95,9 +95,9 @@ def run_topk_benchmark(
     cache = make_fresh_cache()
 
     def call_decode():
-        quest_sparse_attention_decode_paged(
+        sparse_attention_decode_paged(
             q=q,
-            quest_cache=cache,
+            kv_cache=cache,
             k_new=k_new,
             v_new=v_new,
             out=out,
@@ -152,18 +152,22 @@ def run_topk_benchmark(
 # pytest entry points
 # ---------------------------------------------------------------------------
 
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="Triton kernels require CUDA"
+)
+
+
 def _device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+@requires_cuda
 @pytest.mark.parametrize("dtype", TOPK_DTYPES, ids=TOPK_DTYPE_IDS)
 @pytest.mark.parametrize("alpha", TOPK_ALPHAS)
 @pytest.mark.parametrize("batch", TOPK_BATCHES)
 @pytest.mark.parametrize("kv_len", TOPK_KV_LENS)
 @pytest.mark.parametrize("coverage", TOPK_COVERAGES)
 def test_topk_paged_basic(batch, kv_len, coverage, alpha, dtype):
-    if not torch.cuda.is_available():
-        return
     result = run_topk_benchmark(
         seed=1, batch=batch, kv_heads=8, q_heads=8,
         kv_len=kv_len, head_dim=64, page_size=16,
@@ -177,14 +181,13 @@ def test_topk_paged_basic(batch, kv_len, coverage, alpha, dtype):
     assert result["latency_ms"] < 500.0
 
 
+@requires_cuda
 @pytest.mark.parametrize("dtype", TOPK_DTYPES, ids=TOPK_DTYPE_IDS)
 @pytest.mark.parametrize("alpha", TOPK_ALPHAS)
 @pytest.mark.parametrize("batch", TOPK_BATCHES)
 @pytest.mark.parametrize("kv_len", TOPK_KV_LENS)
 @pytest.mark.parametrize("coverage", TOPK_COVERAGES)
 def test_topk_alibi(batch, kv_len, coverage, alpha, dtype):
-    if not torch.cuda.is_available():
-        return
     result = run_topk_benchmark(
         seed=2, batch=batch, kv_heads=8, q_heads=8,
         kv_len=kv_len, head_dim=64, page_size=16,

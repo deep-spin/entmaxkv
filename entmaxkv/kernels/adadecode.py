@@ -751,7 +751,7 @@ def _decode_stage6b_reduce_partials(
 # Orchestrator: sparse_attention_decode_sixstage()      
 # ============================================================ #
 
-def quest_sparse_attention_decode_orchestrator(
+def sparse_attention_decode_orchestrator(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,

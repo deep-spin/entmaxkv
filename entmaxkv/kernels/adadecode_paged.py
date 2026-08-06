@@ -441,10 +441,15 @@ def _paged_stage6a_partial_out(
     seqlen_per_split = tl.cdiv(cache_seqlen, MAX_SPLITS)
     split_start      = split_id * seqlen_per_split
     split_end        = tl.minimum(split_start + seqlen_per_split, cache_seqlen)
+    offs_k = tl.arange(0, H_DIM)
     if split_start >= cache_seqlen:
+        # PARTIAL_OUT is intentionally allocated with torch.empty. Fully
+        # define inactive splits here so the final reduction remains valid
+        # without a separate full-buffer zeroing launch.
+        partial_out_base = PARTIAL_OUT + (off_hz * MAX_SPLITS + split_id) * H_DIM
+        tl.store(partial_out_base + offs_k, 0.0)
         return
 
-    offs_k = tl.arange(0, H_DIM)
     q      = tl.load(Q + off_hz * stride_qh + offs_k) * _scalar
     q      = q.to(input_dtype)
 
@@ -503,10 +508,63 @@ def _paged_stage6a_partial_out(
 
 
 # ============================================================ #
-# Orchestrator: paged sparse attention decode     
+# Orchestrator: paged sparse attention decode
 # ============================================================ #
 
-def quest_sparse_attention_decode_paged(
+def make_adadecode_paged_workspace(
+    batch: int,
+    nheads: int,
+    dim: int,
+    max_splits: int,
+    bins: int,
+    *,
+    device,
+    dtype,
+):
+    """Allocate the intermediates for one exact paged-decode shape."""
+    return {
+        "_spec": (batch, nheads, dim, max_splits, bins, dtype, torch.device(device)),
+        "max_vals": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
+        "global_maxs": torch.empty((batch, nheads), device=device, dtype=torch.float32),
+        "hist_split": torch.empty((batch, nheads, max_splits, bins), device=device, dtype=torch.int32),
+        "hist_global": torch.empty((batch, nheads, bins), device=device, dtype=torch.int32),
+        "partial_out": torch.empty((batch, nheads, max_splits, dim), device=device, dtype=dtype),
+        "taus": torch.empty((batch, nheads), device=device, dtype=torch.float32),
+        "t_los": torch.empty((batch, nheads), device=device, dtype=torch.float32),
+        "t_his": torch.empty((batch, nheads), device=device, dtype=torch.float32),
+        "acc0_split": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
+        "acc1_split": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
+        "acc2_split": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
+    }
+
+
+def _validate_workspace(workspace, batch, nheads, dim, max_splits, bins, dtype, device):
+    expected_spec = (batch, nheads, dim, max_splits, bins, dtype, torch.device(device))
+    if workspace.get("_spec") == expected_spec:
+        return
+    expected = {
+        "max_vals": ((batch, nheads, max_splits), torch.float32),
+        "global_maxs": ((batch, nheads), torch.float32),
+        "hist_split": ((batch, nheads, max_splits, bins), torch.int32),
+        "hist_global": ((batch, nheads, bins), torch.int32),
+        "partial_out": ((batch, nheads, max_splits, dim), dtype),
+        "taus": ((batch, nheads), torch.float32),
+        "t_los": ((batch, nheads), torch.float32),
+        "t_his": ((batch, nheads), torch.float32),
+        "acc0_split": ((batch, nheads, max_splits), torch.float32),
+        "acc1_split": ((batch, nheads, max_splits), torch.float32),
+        "acc2_split": ((batch, nheads, max_splits), torch.float32),
+    }
+    for name, (shape, expected_dtype) in expected.items():
+        tensor = workspace.get(name)
+        if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != expected_dtype or tensor.device != device:
+            raise ValueError(
+                f"invalid paged workspace {name}: expected {shape}/{expected_dtype}/{device}, "
+                f"got {None if tensor is None else (tuple(tensor.shape), tensor.dtype, tensor.device)}"
+            )
+
+
+def sparse_attention_decode_paged(
     q: torch.Tensor,            # [B, H, 1, D]
     k_cache: torch.Tensor,      # [B, H_kv, S, D]  — full cache, never copied
     v_cache: torch.Tensor,      # [B, H_kv, S, D]
@@ -522,6 +580,7 @@ def quest_sparse_attention_decode_paged(
     bins: int = 16,
     q_seqlens: torch.Tensor = None,
     taus_out: torch.Tensor = None,  # optional [B, H] buffer to capture converged tau
+    workspace: dict = None,
 ):
     """
     Page-native six-stage adadecode pipeline.
@@ -554,22 +613,26 @@ def quest_sparse_attention_decode_paged(
         q_seqlens = cache_seqlens
 
     # Intermediates
-    max_vals   = torch.full((batch, nheads, max_splits), float('-inf'),
-                            device=q.device, dtype=torch.float32)
-    global_maxs = torch.empty((batch, nheads), device=q.device, dtype=torch.float32)
+    if workspace is None:
+        workspace = make_adadecode_paged_workspace(
+            batch, nheads, dim, max_splits, bins, device=q.device, dtype=q.dtype
+        )
+    else:
+        _validate_workspace(
+            workspace, batch, nheads, dim, max_splits, bins, q.dtype, q.device
+        )
 
-    hist_split  = torch.zeros((batch, nheads, max_splits, bins),
-                              device=q.device, dtype=torch.int32)
-    hist_global = torch.empty((batch, nheads, bins), device=q.device, dtype=torch.int32)
-
-    partial_out = torch.zeros((batch, nheads, max_splits, dim),
-                              device=q.device, dtype=q.dtype)
-    taus   = torch.empty((batch, nheads), device=q.device, dtype=torch.float32)
-    t_los  = torch.empty((batch, nheads), device=q.device, dtype=torch.float32)
-    t_his  = torch.empty((batch, nheads), device=q.device, dtype=torch.float32)
-    acc0_split = torch.empty((batch, nheads, max_splits), device=q.device, dtype=torch.float32)
-    acc1_split = torch.empty((batch, nheads, max_splits), device=q.device, dtype=torch.float32)
-    acc2_split = torch.empty((batch, nheads, max_splits), device=q.device, dtype=torch.float32)
+    max_vals    = workspace["max_vals"]
+    global_maxs = workspace["global_maxs"]
+    hist_split  = workspace["hist_split"]
+    hist_global = workspace["hist_global"]
+    partial_out = workspace["partial_out"]
+    taus   = workspace["taus"]
+    t_los  = workspace["t_los"]
+    t_his  = workspace["t_his"]
+    acc0_split = workspace["acc0_split"]
+    acc1_split = workspace["acc1_split"]
+    acc2_split = workspace["acc2_split"]
 
     # Strides
     stride_qh  = q.stride(1)

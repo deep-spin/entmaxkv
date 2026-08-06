@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entmaxkv"
+version = "0.1.0"
+description = "EntmaxKV: sparse entmax attention for KV cache compression"
+requires-python = ">=3.10, <3.13"
+dependencies = [
+    "torch==2.6.0",
+    "triton==3.2.0",
+    "numpy",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+# torch must come from the CUDA 12.4 build; the default PyPI wheel targets a
+# newer CUDA runtime than the driver on our nodes (12040) supports.
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["entmaxkv*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

@@ -1,6 +1,6 @@
 import math
 import torch
-from typing import Tuple
+from typing import Optional, Tuple
 
 from entmaxkv.tau_solver import solve_for_tau_hat_single_gaussian
 from entmaxkv.kernels.tau_solver_page_mixture import solve_for_tau_hat_page_gaussian_mixture
@@ -11,6 +11,42 @@ try:
     )
 except Exception:
     solve_for_tau_hat_page_gaussian_mixture_triton = None
+
+
+def solve_for_tau_hat_page_gaussian_mixture_auto(
+    mu_pages: "torch.Tensor",
+    sigma_pages: "torch.Tensor",
+    page_counts: "torch.Tensor" = None,
+    alpha: float = 1.5,
+    max_iter: int = 40,
+    tol: float = 1e-6,
+    uniform_page_count: float = 1.0,
+) -> "torch.Tensor":
+    can_use_triton_tau = (
+        solve_for_tau_hat_page_gaussian_mixture_triton is not None
+        and mu_pages.is_cuda
+        and sigma_pages.is_cuda
+        and (page_counts is None or page_counts.is_cuda)
+    )
+    if can_use_triton_tau:
+        return solve_for_tau_hat_page_gaussian_mixture_triton(
+            mu_pages,
+            sigma_pages,
+            page_counts=page_counts,
+            alpha=alpha,
+            max_iter=max_iter,
+            tol=tol,
+            uniform_page_count=uniform_page_count,
+        )
+    if page_counts is None:
+        page_counts = torch.full(
+            mu_pages.shape, float(uniform_page_count),
+            device=mu_pages.device, dtype=mu_pages.dtype,
+        )
+    return solve_for_tau_hat_page_gaussian_mixture(
+        mu_pages, sigma_pages, page_counts=page_counts, alpha=alpha,
+        max_iter=max_iter, tol=tol,
+    )
 
 try:
     from entmaxkv.kernels.gaussian_page_stats import (
@@ -38,6 +74,8 @@ def compute_gaussian_aware_statistics(
     use_triton_stats: bool = True,
     threshold_excess_margin_fraction: float = 0.2,
     tau_clamp_page_max_quantile: float = 0.50,
+    safety_margin_z: Optional[float] = None,
+    max_quantile: Optional[float] = None,
 ):
     """
     Compute Gaussian score statistics and the distributional entmax tau estimate.
@@ -85,7 +123,9 @@ def compute_gaussian_aware_statistics(
             k_mean=k_mean,
             k_std=k_std,
             pages_for_stats=pages_for_stats,
+            return_sigma=True,
         )
+        sigma_scores_per_page = score_variance_per_page
     else:
         q_scaled = q * scale
         q_var_scaled = q.square() * (scale * scale)
@@ -97,8 +137,7 @@ def compute_gaussian_aware_statistics(
         variance_of_means, raw_mu_global = torch.var_mean(
             mu_scores_per_page, dim=-1, keepdim=True, unbiased=False
         )
-
-    sigma_scores_per_page = torch.sqrt(score_variance_per_page)
+        sigma_scores_per_page = torch.sqrt(score_variance_per_page)
 
     if alibi_slopes is not None:
         slopes = alibi_slopes.to(q.device, dtype=mu_scores_per_page.dtype)
@@ -113,35 +152,28 @@ def compute_gaussian_aware_statistics(
         alibi_bias_per_page = slopes * (page_mean_pos - q_pos)
         mu_scores_per_page = mu_scores_per_page + alibi_bias_per_page
     
-    mu_global = raw_mu_global
-    sigma_global = torch.sqrt(mean_variance + variance_of_means).clamp(min=1e-6)
+    mu_global = torch.nan_to_num(raw_mu_global, nan=0.0, posinf=0.0, neginf=0.0)
+    sigma_global = torch.nan_to_num(
+        torch.sqrt(mean_variance + variance_of_means),
+        nan=1e-6,
+        posinf=1e6,
+        neginf=1e-6,
+    ).clamp(min=1e-6)
 
-    sigma_scalar = sigma_global.mean()
-    low_sigma = sigma_scalar < 1.5
-    safety_margin_z = (0.01 if low_sigma else 0.05) * sigma_scalar.item()
-    max_quantile = 0.99 if low_sigma else 0.995
-    has_nan = torch.isnan(mu_global).any() or torch.isnan(sigma_global).any()
+    if safety_margin_z is None or max_quantile is None:
+        sigma_scalar = sigma_global.mean()
+        low_sigma = bool((sigma_scalar < 1.5).item())
+        if safety_margin_z is None:
+            safety_margin_z = (0.01 if low_sigma else 0.05) * float(sigma_scalar.item())
+        if max_quantile is None:
+            max_quantile = 0.99 if low_sigma else 0.995
 
-    if has_nan:
-        tau_hat = mu_global
-    elif alibi_slopes is not None:
-        page_counts = torch.full(
-            (1, 1, pages_for_stats), float(page_size),
-            device=mu_scores_per_page.device, dtype=mu_scores_per_page.dtype,
-        )
-        can_use_triton_tau = (
-            solve_for_tau_hat_page_gaussian_mixture_triton is not None
-            and mu_scores_per_page.is_cuda
-            and sigma_scores_per_page.is_cuda
-            and page_counts.is_cuda
-        )
-        tau_solver = (
-            solve_for_tau_hat_page_gaussian_mixture_triton
-            if can_use_triton_tau
-            else solve_for_tau_hat_page_gaussian_mixture
-        )
-        tau_hat = tau_solver(
-            mu_scores_per_page, sigma_scores_per_page, page_counts=page_counts, alpha=alpha
+    if alibi_slopes is not None:
+        tau_hat = solve_for_tau_hat_page_gaussian_mixture_auto(
+            mu_scores_per_page,
+            sigma_scores_per_page,
+            alpha=alpha,
+            uniform_page_count=float(page_size),
         )  # [B, H, 1] — squeezed at stats dict assignment below
     else:
         tau_hat = solve_for_tau_hat_single_gaussian(

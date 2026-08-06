@@ -1,4 +1,5 @@
 import torch
+from typing import Optional
 
 try:
     from entmaxkv.kernels.page_criticality import triton_estimate_page_criticality
@@ -12,9 +13,9 @@ except Exception:
 
 
 
-class QuestKVCache:
+class PagedKVCache:
     """
-    KV Cache with Quest-style metadata tracking for criticality estimation.
+    KV Cache with paged metadata tracking for criticality estimation.
 
     Maintains min/max/mean/std statistics per page for efficient query-aware sparsity.
     """
@@ -29,6 +30,12 @@ class QuestKVCache:
         self.k_std = None
 
         self.last_num_selected_per_head = None
+
+        # Persistent decode-step buffers, reused across calls to avoid
+        # per-step allocation churn.
+        self._page_indices_buf: Optional[torch.Tensor] = None
+        self._page_indices_last_page: Optional[int] = None
+        self._paged_decode_workspaces: dict = {}
 
     def initialize(self, k: torch.Tensor, v: torch.Tensor):
         """Initialize cache with prefill keys/values."""
@@ -111,7 +118,8 @@ class QuestKVCache:
     def estimate_page_criticality(self, q: torch.Tensor,
                                     use_triton: bool = False,
                                     alibi_slopes=None,
-                                    q_pos: int = 0) -> torch.Tensor:
+                                    q_pos: int = 0,
+                                    exclude_last_page: bool = False) -> torch.Tensor:
         """
         Estimate criticality scores for each page given a query.
 
@@ -124,6 +132,7 @@ class QuestKVCache:
             use_triton: If True, use fused Triton kernel (default: False)
             alibi_slopes: [num_heads] float32 raw slopes; bonus computed in-kernel or Python-side.
             q_pos: absolute position of the query token (seq_len - 1).
+            exclude_last_page: drop the in-progress last page from scoring.
 
         Returns:
             page_scores: Upper bound scores per page [batch, heads, pages]
@@ -135,9 +144,12 @@ class QuestKVCache:
                 q_pos=q_pos,
                 page_size=self.page_size,
                 seq_len=self.k_cache.shape[2],
+                exclude_last_page=exclude_last_page,
             )
 
-        upper_bound = torch.maximum(q * self.k_min, q * self.k_max)
+        k_min = self.k_min[:, :, :-1, :] if exclude_last_page else self.k_min
+        k_max = self.k_max[:, :, :-1, :] if exclude_last_page else self.k_max
+        upper_bound = torch.maximum(q * k_min, q * k_max)
         page_scores = upper_bound.sum(dim=-1)
 
         if alibi_slopes is not None:
@@ -151,6 +163,44 @@ class QuestKVCache:
             page_scores = page_scores + alibi_bonus
 
         return page_scores
+
+    def get_page_indices_buf(
+        self, batch: int, num_heads: int, num_pages_to_select: int, last_page_idx: int
+    ) -> torch.Tensor:
+        """Return a persistent [B, H, n_selected+1] page-indices buffer.
+
+        Avoids a torch.empty + fill_ every decode step. During autoregressive
+        decode the last page changes only once per page_size steps, so the
+        fill_ for the sentinel column is skipped on the other steps.
+        """
+        target_shape = (batch, num_heads, num_pages_to_select + 1)
+        buf = self._page_indices_buf
+        if buf is None or tuple(buf.shape) != target_shape or buf.device != self.k_cache.device:
+            buf = torch.empty(target_shape, dtype=torch.int32, device=self.k_cache.device)
+            self._page_indices_buf = buf
+            self._page_indices_last_page = None
+        if self._page_indices_last_page != last_page_idx:
+            buf[:, :, num_pages_to_select].fill_(last_page_idx)
+            self._page_indices_last_page = last_page_idx
+        return buf
+
+    def get_paged_decode_workspace(
+        self, batch: int, nheads: int, dim: int, max_splits: int, bins: int,
+        dtype: torch.dtype, device: torch.device,
+    ) -> dict:
+        """Return a persistent workspace for one exact paged-kernel shape."""
+        device = torch.device(device)
+        key = (batch, nheads, dim, max_splits, bins, dtype, device.type, device.index)
+        workspace = self._paged_decode_workspaces.get(key)
+        if workspace is None:
+            from entmaxkv.kernels.adadecode_paged import (
+                make_adadecode_paged_workspace,
+            )
+            workspace = make_adadecode_paged_workspace(
+                batch, nheads, dim, max_splits, bins, device=device, dtype=dtype
+            )
+            self._paged_decode_workspaces[key] = workspace
+        return workspace
 
     def select_gaussian_aware(self, q: torch.Tensor, alpha: float = 1.5, safety_margin_z: float = 0.0,
                                max_quantile: float = 0.99,

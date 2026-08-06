@@ -53,7 +53,7 @@ def _decode_stage5b_halley_update_unbounded(
     tl.store(TAUS + off_hz * stride_th, t_next)
 
 
-# Inlined from quest_adadecode_paged_optimized.py — self-contained Triton kernel.
+# Inlined from adadecode_paged_optimized.py — self-contained Triton kernel.
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_N': 32},  num_warps=2, num_stages=2),
@@ -189,7 +189,7 @@ def make_gaussian_tau_workspace(
     }
 
 
-def quest_sparse_attention_decode_paged_gaussian_tau(
+def sparse_attention_decode_paged_gaussian_tau(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
