@@ -17,13 +17,19 @@ Tokens in the KV cache are organized into fixed-size pages (default: 16 tokens).
 
 ## Installation
 
+This project uses [uv](https://docs.astral.sh/uv/) with a `pyproject.toml`/`uv.lock`:
+
 ```bash
-pip install -e .
-# optional: scipy for diagnostics
-pip install -e ".[diagnostics]"
+uv sync
 ```
 
-**Requirements**: Python ≥ 3.10, PyTorch ≥ 2.5, Triton ≥ 3.0, CUDA GPU.
+Alternatively, install with pip:
+
+```bash
+pip install -e .
+```
+
+**Requirements**: Python ≥ 3.10, < 3.13, PyTorch 2.6.0, Triton 3.2.0, CUDA GPU (CUDA 12.4 build).
 
 ## Quick start
 
@@ -90,22 +96,30 @@ entmaxkv/
     ├── tau_mixture_solver_triton.py     # Triton mixture tau solver (ALiBi)
     └── triton_entmax.py                 # Dense entmax reference implementation
 tests/
-├── test_topk.py                         # Top-k attention benchmarks
-├── test_gaussian.py                     # Gaussian-aware attention benchmarks
-└── benchmark_utils.py                   # Reference attention, timing, error metrics
+├── test_topk.py                         # Top-k attention correctness benchmarks (pytest)
+├── test_gaussian.py                     # Gaussian-aware attention correctness benchmarks (pytest)
+├── benchmark_utils.py                   # Reference attention, timing, error metrics
+└── run_benchmarks.py                    # Standalone CLI for kernel-only timing sweeps
 ```
 
 ## Running tests
 
+`test_topk.py` and `test_gaussian.py` are pytest test suites (parametrized over batch size, kv length, dtype, etc.), so run them with pytest rather than as plain scripts:
+
 ```bash
 # Top-k sparse attention
-python tests/test_topk.py
+uv run pytest tests/test_topk.py -v -s
 
 # Gaussian-aware attention
-python tests/test_gaussian.py
+uv run pytest tests/test_gaussian.py -v -s
 ```
 
-Benchmarks vary batch size, context length (1K–64K tokens), coverage (25%–50%), alpha, and dtype. They report L2 error, relative error, cosine similarity vs. dense reference attention, and per-iteration latency.
+For raw kernel timing (no reference attention or error metrics), use `run_benchmarks.py`:
+
+```bash
+uv run python tests/run_benchmarks.py topk
+uv run python tests/run_benchmarks.py gaussian
+```
 
 
 ## Efficiency
