@@ -29,6 +29,9 @@ GAUSSIAN_BATCHES = [1, 8]
 GAUSSIAN_KV_LENS = [ 2048, 8192, 16384, 64000]
 GAUSSIAN_DTYPES = [torch.float16, torch.float32]
 GAUSSIAN_DTYPE_IDS = ["fp16", "fp32"]
+# (kv_heads, q_heads): MHA, and GQA with 2 query heads per KV head.
+GAUSSIAN_HEADS = [(8, 8), (8, 16)]
+GAUSSIAN_HEAD_IDS = ["mha", "gqa"]
 
 
 # ---------------------------------------------------------------------------
@@ -60,21 +63,18 @@ def run_gaussian_benchmark(
 
     alibi = generate_alibi_slopes(q_heads) if use_alibi else None
 
-    q      = torch.randn(batch, kv_heads, 1,      head_dim, device=device, dtype=dtype).contiguous()
+    q      = torch.randn(batch, q_heads,  1,      head_dim, device=device, dtype=dtype).contiguous()
     k_full = torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype).contiguous()
     v_full = torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype).contiguous()
-    if q_heads != kv_heads:
-        q = q.repeat_interleave(q_heads // kv_heads, dim=1)
 
     k_new = torch.randn(batch, kv_heads, 1, head_dim, device=device, dtype=dtype).contiguous()
     v_new = torch.randn(batch, kv_heads, 1, head_dim, device=device, dtype=dtype).contiguous()
 
-    full_seq_len = kv_len + 1
-    q_seqlens = torch.full((batch,), full_seq_len, device=device, dtype=torch.int32)
     out = torch.zeros_like(q)
 
     def make_fresh_cache():
-        c = PagedKVCache(page_size=page_size)
+        c = PagedKVCache(page_size=page_size, stats=("gaussian",),
+                         max_seq_len=kv_len + 1)
         c.initialize(k_full, v_full)
         c.append(k_new, v_new)
         return c
@@ -94,7 +94,6 @@ def run_gaussian_benchmark(
             alibi_slopes=alibi,
             append_cache=False,
             tau_mode=tau_mode,
-            q_seqlens=q_seqlens,
         )
 
     latency_ms = time_fn(call_decode, warmup=warmup, iters=iters)
@@ -158,9 +157,10 @@ def _device():
 @pytest.mark.parametrize("dtype", GAUSSIAN_DTYPES, ids=GAUSSIAN_DTYPE_IDS)
 @pytest.mark.parametrize("batch", GAUSSIAN_BATCHES)
 @pytest.mark.parametrize("kv_len", GAUSSIAN_KV_LENS)
-def test_gaussian_exact_basic(batch, kv_len, dtype):
+@pytest.mark.parametrize("heads", GAUSSIAN_HEADS, ids=GAUSSIAN_HEAD_IDS)
+def test_gaussian_exact_basic(batch, kv_len, dtype, heads):
     result = run_gaussian_benchmark(
-        seed=10, batch=batch, kv_heads=8, q_heads=8,
+        seed=10, batch=batch, kv_heads=heads[0], q_heads=heads[1],
         kv_len=kv_len, head_dim=64, page_size=16,
         tau_mode="exact", use_alibi=False,
         dtype=dtype, device=_device(), print_results=False,
@@ -173,9 +173,10 @@ def test_gaussian_exact_basic(batch, kv_len, dtype):
 @pytest.mark.parametrize("dtype", GAUSSIAN_DTYPES, ids=GAUSSIAN_DTYPE_IDS)
 @pytest.mark.parametrize("batch", GAUSSIAN_BATCHES)
 @pytest.mark.parametrize("kv_len", GAUSSIAN_KV_LENS)
-def test_gaussian_corrected_basic(batch, kv_len, dtype):
+@pytest.mark.parametrize("heads", GAUSSIAN_HEADS, ids=GAUSSIAN_HEAD_IDS)
+def test_gaussian_corrected_basic(batch, kv_len, dtype, heads):
     result = run_gaussian_benchmark(
-        seed=12, batch=batch, kv_heads=8, q_heads=8,
+        seed=12, batch=batch, kv_heads=heads[0], q_heads=heads[1],
         kv_len=kv_len, head_dim=64, page_size=16,
         tau_mode="corrected", use_alibi=False,
         dtype=dtype, device=_device(), print_results=False,
@@ -186,9 +187,10 @@ def test_gaussian_corrected_basic(batch, kv_len, dtype):
 @pytest.mark.parametrize("dtype", GAUSSIAN_DTYPES, ids=GAUSSIAN_DTYPE_IDS)
 @pytest.mark.parametrize("batch", GAUSSIAN_BATCHES)
 @pytest.mark.parametrize("kv_len", GAUSSIAN_KV_LENS)
-def test_gaussian_corrected_alibi(batch, kv_len, dtype):
+@pytest.mark.parametrize("heads", GAUSSIAN_HEADS, ids=GAUSSIAN_HEAD_IDS)
+def test_gaussian_corrected_alibi(batch, kv_len, dtype, heads):
     result = run_gaussian_benchmark(
-        seed=12, batch=batch, kv_heads=8, q_heads=8,
+        seed=12, batch=batch, kv_heads=heads[0], q_heads=heads[1],
         kv_len=kv_len, head_dim=64, page_size=16,
         tau_mode="corrected", use_alibi=True,
         dtype=dtype, device=_device(), print_results=False,
@@ -200,9 +202,10 @@ def test_gaussian_corrected_alibi(batch, kv_len, dtype):
 @pytest.mark.parametrize("dtype", GAUSSIAN_DTYPES, ids=GAUSSIAN_DTYPE_IDS)
 @pytest.mark.parametrize("batch", GAUSSIAN_BATCHES)
 @pytest.mark.parametrize("kv_len", GAUSSIAN_KV_LENS)
-def test_gaussian_exact_alibi(batch, kv_len, dtype):
+@pytest.mark.parametrize("heads", GAUSSIAN_HEADS, ids=GAUSSIAN_HEAD_IDS)
+def test_gaussian_exact_alibi(batch, kv_len, dtype, heads):
     result = run_gaussian_benchmark(
-        seed=13, batch=batch, kv_heads=8, q_heads=8,
+        seed=13, batch=batch, kv_heads=heads[0], q_heads=heads[1],
         kv_len=kv_len, head_dim=64, page_size=16,
         tau_mode="exact", use_alibi=True,
         dtype=dtype, device=_device(), print_results=False,

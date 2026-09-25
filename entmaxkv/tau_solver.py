@@ -1,13 +1,13 @@
+"""CPU reference solvers for the Gaussian tau-hat.
+
+The decode path uses the Triton solvers in
+``entmaxkv.kernels.gaussian.tau_solver``; these float64 implementations are
+kept as test oracles and for debugging (``verbose=True``).
+"""
+
 import torch
 import math
 from typing import Tuple
-
-try:
-    from entmaxkv.kernels.tau_solver_gpu import solve_for_tau_hat_single_gaussian_gpu
-    _HAS_GPU_SOLVER = True
-except Exception:
-    solve_for_tau_hat_single_gaussian_gpu = None
-    _HAS_GPU_SOLVER = False
 
 
 def _gaussian_cdf(x: torch.Tensor) -> torch.Tensor:
@@ -72,10 +72,10 @@ def _evaluate_constraint(
         expectation = (mu_Y.pow(2) + sigma_Y.pow(2)) * Phi_t + mu_Y * sigma_Y * phi_t
     elif alpha == 4/3:
         # Case α = 4/3 (β = 3): Equation 112
-        # E[g_α(S; τ)] = (μ_Y³ + 3μ_Y σ_Y²) Φ(t) + (σ_Y³ + 2μ_Y² σ_Y) φ(t)
+        # E[g_α(S; τ)] = (μ_Y³ + 3μ_Y σ_Y²) Φ(t) + (μ_Y² σ_Y + 2σ_Y³) φ(t)
         phi_t = _gaussian_pdf(t)
         Phi_t = _gaussian_cdf(t)
-        expectation = (mu_Y.pow(3) + 3.0 * mu_Y * sigma_Y.pow(2)) * Phi_t + (sigma_Y.pow(3) + 2.0 * mu_Y.pow(2) * sigma_Y) * phi_t
+        expectation = (mu_Y.pow(3) + 3.0 * mu_Y * sigma_Y.pow(2)) * Phi_t + (mu_Y.pow(2) * sigma_Y + 2.0 * sigma_Y.pow(3)) * phi_t
 
     else:
         # Fallback: use simple approximation
@@ -103,7 +103,7 @@ def _truncated_moments(
     m2 = (mu_Y.pow(2) + sigma_Y.pow(2)) * Phi_t + mu_Y * sigma_Y * phi_t
     m3 = (
         (mu_Y.pow(3) + 3.0 * mu_Y * sigma_Y.pow(2)) * Phi_t
-        + (sigma_Y.pow(3) + 2.0 * mu_Y.pow(2) * sigma_Y) * phi_t
+        + (mu_Y.pow(2) * sigma_Y + 2.0 * sigma_Y.pow(3)) * phi_t
     )
     return m0, m1, m2, m3
 
@@ -166,7 +166,7 @@ def _evaluate_constraint_scalar(
         Phi_t = _gaussian_cdf_scalar(t)
         expectation = (
             (mu_Y ** 3 + 3.0 * mu_Y * sigma_Y * sigma_Y) * Phi_t
-            + (sigma_Y ** 3 + 2.0 * mu_Y * mu_Y * sigma_Y) * phi_t
+            + (mu_Y * mu_Y * sigma_Y + 2.0 * sigma_Y ** 3) * phi_t
         )
     else:
         truncated_moment = max(t, 0.0) ** beta
@@ -376,17 +376,6 @@ def solve_for_tau_hat_single_gaussian(
         tau_hat: Threshold value [batch, heads, 1]
     """
     original_dtype = mu_g.dtype
-    if _HAS_GPU_SOLVER and mu_g.is_cuda and alpha in (2, 1.5) and not verbose:
-        tau = solve_for_tau_hat_single_gaussian_gpu(
-            mu_g=mu_g,
-            sigma_g=sigma_g,
-            n=n,
-            alpha=alpha,
-            iterations=max_iter,
-            tol=tol,
-        )
-        return tau.to(dtype=original_dtype)
-
     mu_g = mu_g.double()
     sigma_g = sigma_g.double()
 

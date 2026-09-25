@@ -1,10 +1,29 @@
+"""Generic-alpha entmax decode over a selected page set (paged layout).
+
+This is the fallback for alpha outside {1.5, 2.0}, which the one-K-pass
+``selected_decode`` kernels do not cover. It keeps AdaDecode's six-stage
+structure (max -> histogram -> tau init -> Halley/bisection -> output) and its
+generic-alpha tau initialisation, but consumes the same inputs as
+``selected_decode``:
+
+* ``kv_cache`` is ``[2, num_blocks, block_size, H_kv, D]`` and every access
+  resolves ``logical page -> block_table[req, logical] -> physical block``;
+* ``selected_pages`` is keyed by QUERY head (``[B, H_q, n]``, -1 padded, tail
+  last) and ``sel_lens[b, h]`` counts its tokens, so GQA siblings may select
+  different pages while K/V stay compact;
+* ALiBi slopes are indexed by query head and applied at logical positions.
+
+Work is split over the compacted token index ``c``: page rank ``c // BLOCK``,
+in-page offset ``c % BLOCK``. Every stage recomputes scores from K.
+"""
+
 import math
+
 import torch
 import triton
 import triton.language as tl
 
-# Re-use shared helpers from the original file (tau init, halley update, etc.)
-from entmaxkv.kernels.adadecode import (
+from entmaxkv.kernels.adadecode_common import (
     _decode_stage2_reduce_max,
     _decode_stage4_reduce_hist,
     _decode_stage5_init,
@@ -12,751 +31,390 @@ from entmaxkv.kernels.adadecode import (
     _decode_stage6b_reduce_partials,
 )
 
+ADADECODE_SPLITS = 32
+ADADECODE_BINS = 16
+ADADECODE_BLOCK_N = 64
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Helper: compact index → original cache row
-# ─────────────────────────────────────────────────────────────────────────────
 
 @triton.jit
-def _compact_to_orig(c_idx, page_indices_base, PAGE_SIZE: tl.constexpr):
-    """
-    Map a compacted sequential index to the original K/V cache row index.
-
-    page_indices_base : pointer to PAGE_INDICES[b, h, 0]  (int32)
-    PAGE_SIZE         : compile-time page size (tl.constexpr)
-    """
-    page_rank   = c_idx // PAGE_SIZE
-    in_page_off = c_idx %  PAGE_SIZE
-    orig_page   = tl.load(page_indices_base + page_rank).to(tl.int32)
-    return orig_page * PAGE_SIZE + in_page_off
+def _split_bounds(SEL_LENS, req, head, split, stride_lb: tl.constexpr,
+                  MAX_SPLITS: tl.constexpr):
+    selected_tokens = tl.load(SEL_LENS + req * stride_lb + head).to(tl.int32)
+    per_split = tl.cdiv(selected_tokens, MAX_SPLITS)
+    start = split * per_split
+    end = tl.minimum(start + per_split, selected_tokens)
+    return start, end, selected_tokens
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 1 – per-split local maxima
-# grid = (B, H, MAX_SPLITS)
-# ─────────────────────────────────────────────────────────────────────────────
+@triton.jit
+def _block_scores(q, slope, q_pos, compact, valid, sel_base, bt_base,
+                  K, kv_head, offs_d,
+                  stride_kblock: tl.constexpr, stride_ktok: tl.constexpr,
+                  stride_kh: tl.constexpr, stride_kd: tl.constexpr,
+                  BLOCK_SIZE: tl.constexpr):
+    """(alpha-1)-scaled scores for compact indices; -inf where invalid."""
+    rank, token = compact // BLOCK_SIZE, compact % BLOCK_SIZE
+    logical = tl.load(sel_base + rank, mask=valid, other=0).to(tl.int32)
+    physical = tl.load(bt_base + logical, mask=valid, other=0).to(tl.int64)
+    rows = physical * stride_kblock + token * stride_ktok + kv_head * stride_kh
+    k = tl.load(K + rows[:, None] + offs_d[None, :] * stride_kd,
+                mask=valid[:, None], other=0.0)
+    score = tl.sum((q[None, :] * k).to(tl.float32), axis=1)
+    pos = logical * BLOCK_SIZE + token
+    score += slope * (pos - q_pos).to(tl.float32)
+    return tl.where(valid, score, -float("inf"))
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 32},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=2),
-    ],
-    key=['H_DIM', 'USE_ALIBI', 'PAGE_SIZE'],
-)
+
+@triton.jit
+def _load_query(Q, SLOPES, SEQ_LENS, req, head, offs_d,
+                stride_qb: tl.constexpr, stride_qh: tl.constexpr,
+                alpha: tl.constexpr, sm_scale: tl.constexpr):
+    q = tl.load(Q + req * stride_qb + head * stride_qh + offs_d)
+    q = (q * ((alpha - 1.0) * sm_scale)).to(Q.dtype.element_ty)
+    slope = tl.load(SLOPES + head).to(tl.float32) * (alpha - 1.0)
+    q_pos = tl.load(SEQ_LENS + req).to(tl.int32) - 1
+    return q, slope, q_pos
+
+
 @triton.jit
 def _paged_stage1_local_max(
-    Q, K_cache,
-    MAX_VALS,
-    PAGE_INDICES,
-    Cache_seqlens,
-    Q_Seqlens,
-    ALIBI_SLOPES,
-    ##
-    alpha: tl.constexpr,
-    sm_scale: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    ##
-    N_H: tl.constexpr,
-    N_KVH: tl.constexpr,
-    H_DIM: tl.constexpr,
-    MAX_SPLITS: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    ##
-    stride_qh: tl.constexpr,
-    stride_kz: tl.constexpr,   # batch stride in K_cache
-    stride_kh: tl.constexpr,   # head stride in K_cache
-    stride_csz: tl.constexpr,  # batch stride in Cache_seqlens
-    stride_csh: tl.constexpr,  # kv-head stride in Cache_seqlens
-    stride_ah: tl.constexpr,
-    stride_piz: tl.constexpr,  # batch stride in PAGE_INDICES
-    stride_pih: tl.constexpr,  # head stride in PAGE_INDICES
-    ##
+    Q, K, BLOCK_TABLE, SELECTED, SEL_LENS, SEQ_LENS, SLOPES, MAX_VALS,
+    stride_qb: tl.constexpr, stride_qh: tl.constexpr,
+    stride_kblock: tl.constexpr, stride_ktok: tl.constexpr,
+    stride_kh: tl.constexpr, stride_kd: tl.constexpr,
+    stride_btb: tl.constexpr, stride_selb: tl.constexpr,
+    stride_selh: tl.constexpr, stride_lb: tl.constexpr,
+    alpha: tl.constexpr, sm_scale: tl.constexpr,
+    N_H: tl.constexpr, N_KVH: tl.constexpr, H_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, MAX_SPLITS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    _scalar = (alpha - 1) * sm_scale
-    input_dtype = Q.dtype.element_ty
-
-    off_z    = tl.program_id(0)
-    off_h    = tl.program_id(1)
-    split_id = tl.program_id(2)
-    off_hz   = off_z * N_H + off_h
-    kv_h     = off_h if N_H == N_KVH else off_h // (N_H // N_KVH)
-
-    cache_seqlen     = tl.load(Cache_seqlens + off_z * stride_csz + kv_h * stride_csh).to(tl.int32)
-    seqlen_per_split = tl.cdiv(cache_seqlen, MAX_SPLITS)
-    split_start      = split_id * seqlen_per_split
-    split_end        = tl.minimum(split_start + seqlen_per_split, cache_seqlen)
-    if split_start >= cache_seqlen:
-        tl.store(MAX_VALS + off_hz * MAX_SPLITS + split_id, -1.0e6)
+    req, head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hz = req * N_H + head
+    start, end, total = _split_bounds(SEL_LENS, req, head, split, stride_lb,
+                                      MAX_SPLITS)
+    if start >= total:
+        tl.store(MAX_VALS + hz * MAX_SPLITS + split, -1.0e6)
         return
-
-    offs_k = tl.arange(0, H_DIM)
-    q      = tl.load(Q + off_hz * stride_qh + offs_k) * _scalar
-    q      = q.to(input_dtype)
-
-    alibi_slope = 0.0
-    if USE_ALIBI:
-        alibi_slope = tl.load(ALIBI_SLOPES + off_h) * (alpha - 1)
-    q_idx = tl.load(Q_Seqlens + off_z).to(tl.int32) - 1
-
-    page_indices_base = PAGE_INDICES + off_z * stride_piz + kv_h * stride_pih
-    k_head_base       = K_cache + off_z * stride_kz + kv_h * stride_kh
-
+    kv_head = head // (N_H // N_KVH)
+    offs_d = tl.arange(0, H_DIM)
+    q, slope, q_pos = _load_query(Q, SLOPES, SEQ_LENS, req, head, offs_d,
+                                  stride_qb, stride_qh, alpha, sm_scale)
+    sel_base = SELECTED + req * stride_selb + head * stride_selh
+    bt_base = BLOCK_TABLE + req * stride_btb
     offs_n = tl.arange(0, BLOCK_N)
-    local_max    = -1.0e6
-    valid_blocks = tl.cdiv(split_end - split_start, BLOCK_N)
-
-    for c_block in range(valid_blocks):
-        c_idxs = split_start + c_block * BLOCK_N + offs_n
-        c_mask = c_idxs < split_end
-
-        page_ranks   = c_idxs // PAGE_SIZE
-        in_page_offs = c_idxs %  PAGE_SIZE
-        orig_pages   = tl.load(page_indices_base + page_ranks, mask=c_mask, other=0).to(tl.int32)
-        orig_rows    = orig_pages * PAGE_SIZE + in_page_offs   # actual cache row
-
-        k_ptrs = k_head_base + orig_rows[:, None] * H_DIM + offs_k[None, :]
-        k = tl.load(k_ptrs, mask=c_mask[:, None], other=0.0).to(input_dtype)
-
-        qk = tl.sum(q[None, :] * k, axis=1)
-        if USE_ALIBI:
-            position_diff = -(q_idx - orig_rows)
-            qk += alibi_slope * position_diff
-
-        qk = tl.where(c_mask, qk, float("-inf"))
-        local_max = tl.maximum(local_max, tl.max(qk))
-
-    tl.store(MAX_VALS + off_hz * MAX_SPLITS + split_id, local_max)
+    local_max = -1.0e6
+    for block in range(tl.cdiv(end - start, BLOCK_N)):
+        compact = start + block * BLOCK_N + offs_n
+        score = _block_scores(q, slope, q_pos, compact, compact < end,
+                              sel_base, bt_base, K, kv_head, offs_d,
+                              stride_kblock, stride_ktok, stride_kh,
+                              stride_kd, BLOCK_SIZE)
+        local_max = tl.maximum(local_max, tl.max(score))
+    tl.store(MAX_VALS + hz * MAX_SPLITS + split, local_max)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 3 – per-split histograms
-# grid = (B, H, MAX_SPLITS)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 32},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=2),
-    ],
-    key=['H_DIM', 'USE_ALIBI', 'PAGE_SIZE'],
-)
 @triton.jit
 def _paged_stage3_build_hist(
-    Q, K_cache,
-    GLOBAL_MAXS,
-    HIST_SPLIT,
-    PAGE_INDICES,
-    Cache_seqlens,
-    Q_Seqlens,
-    ALIBI_SLOPES,
-    ##
-    alpha: tl.constexpr,
-    sm_scale: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    ##
-    N_H: tl.constexpr,
-    N_KVH: tl.constexpr,
-    H_DIM: tl.constexpr,
-    MAX_SPLITS: tl.constexpr,
-    BINS: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    ##
-    stride_qh: tl.constexpr,
-    stride_kz: tl.constexpr,
-    stride_kh: tl.constexpr,
-    stride_csz: tl.constexpr,
-    stride_csh: tl.constexpr,
-    stride_ah: tl.constexpr,
-    stride_piz: tl.constexpr,
-    stride_pih: tl.constexpr,
-    ##
-    BLOCK_N: tl.constexpr,
+    Q, K, BLOCK_TABLE, SELECTED, SEL_LENS, SEQ_LENS, SLOPES,
+    GLOBAL_MAXS, HIST_SPLIT,
+    stride_qb: tl.constexpr, stride_qh: tl.constexpr,
+    stride_kblock: tl.constexpr, stride_ktok: tl.constexpr,
+    stride_kh: tl.constexpr, stride_kd: tl.constexpr,
+    stride_btb: tl.constexpr, stride_selb: tl.constexpr,
+    stride_selh: tl.constexpr, stride_lb: tl.constexpr,
+    alpha: tl.constexpr, sm_scale: tl.constexpr,
+    N_H: tl.constexpr, N_KVH: tl.constexpr, H_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, MAX_SPLITS: tl.constexpr,
+    BINS: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    _scalar = (alpha - 1) * sm_scale
-    input_dtype = Q.dtype.element_ty
-
-    off_z    = tl.program_id(0)
-    off_h    = tl.program_id(1)
-    split_id = tl.program_id(2)
-    off_hz   = off_z * N_H + off_h
-    kv_h     = off_h if N_H == N_KVH else off_h // (N_H // N_KVH)
-
-    cache_seqlen     = tl.load(Cache_seqlens + off_z * stride_csz + kv_h * stride_csh).to(tl.int32)
-    seqlen_per_split = tl.cdiv(cache_seqlen, MAX_SPLITS)
-    split_start      = split_id * seqlen_per_split
-    split_end        = tl.minimum(split_start + seqlen_per_split, cache_seqlen)
-    if split_start >= cache_seqlen:
-        bins = tl.arange(0, BINS)
-        base = ((off_hz * MAX_SPLITS + split_id) * BINS)
+    req, head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hz = req * N_H + head
+    bins = tl.arange(0, BINS)
+    base = (hz * MAX_SPLITS + split) * BINS
+    start, end, total = _split_bounds(SEL_LENS, req, head, split, stride_lb,
+                                      MAX_SPLITS)
+    if start >= total:
         tl.store(HIST_SPLIT + base + bins, tl.zeros((BINS,), dtype=tl.int32))
         return
-
-    offs_k = tl.arange(0, H_DIM)
-    q      = tl.load(Q + off_hz * stride_qh + offs_k) * _scalar
-    q      = q.to(input_dtype)
-
-    alibi_slope = 0.0
-    if USE_ALIBI:
-        alibi_slope = tl.load(ALIBI_SLOPES + off_h) * (alpha - 1)
-    q_idx = tl.load(Q_Seqlens + off_z).to(tl.int32) - 1
-
-    global_max = tl.load(GLOBAL_MAXS + off_hz)
-    t0 = global_max - 1.0
-
-    page_indices_base = PAGE_INDICES + off_z * stride_piz + kv_h * stride_pih
-    k_head_base       = K_cache + off_z * stride_kz + kv_h * stride_kh
-
-    hist   = tl.zeros((BINS,), dtype=tl.int32)
-    bins   = tl.arange(0, BINS)
+    kv_head = head // (N_H // N_KVH)
+    offs_d = tl.arange(0, H_DIM)
+    q, slope, q_pos = _load_query(Q, SLOPES, SEQ_LENS, req, head, offs_d,
+                                  stride_qb, stride_qh, alpha, sm_scale)
+    sel_base = SELECTED + req * stride_selb + head * stride_selh
+    bt_base = BLOCK_TABLE + req * stride_btb
+    t0 = tl.load(GLOBAL_MAXS + hz) - 1.0
+    hist = tl.zeros((BINS,), dtype=tl.int32)
     offs_n = tl.arange(0, BLOCK_N)
-    valid_blocks = tl.cdiv(split_end - split_start, BLOCK_N)
-
-    for c_block in range(valid_blocks):
-        c_idxs = split_start + c_block * BLOCK_N + offs_n
-        c_mask = c_idxs < split_end
-
-        page_ranks   = c_idxs // PAGE_SIZE
-        in_page_offs = c_idxs %  PAGE_SIZE
-        orig_pages   = tl.load(page_indices_base + page_ranks, mask=c_mask, other=0).to(tl.int32)
-        orig_rows    = orig_pages * PAGE_SIZE + in_page_offs
-
-        k_ptrs = k_head_base + orig_rows[:, None] * H_DIM + offs_k[None, :]
-        k = tl.load(k_ptrs, mask=c_mask[:, None], other=0.0).to(input_dtype)
-
-        qk = tl.sum(q[None, :] * k, axis=1)
-        if USE_ALIBI:
-            qk += alibi_slope * (-(q_idx - orig_rows))
-
-        proj  = qk - t0
-        b     = (proj * BINS).to(tl.int32)
-        b     = tl.minimum(b, BINS - 1)
-        valid = c_mask & (b >= 0)
-
-        eq   = (b[:, None] == bins[None, :])
-        cnts = tl.sum(eq & valid[:, None], axis=0).to(tl.int32)
-        hist += cnts
-
-    base = ((off_hz * MAX_SPLITS + split_id) * BINS)
+    for block in range(tl.cdiv(end - start, BLOCK_N)):
+        compact = start + block * BLOCK_N + offs_n
+        valid = compact < end
+        score = _block_scores(q, slope, q_pos, compact, valid,
+                              sel_base, bt_base, K, kv_head, offs_d,
+                              stride_kblock, stride_ktok, stride_kh,
+                              stride_kd, BLOCK_SIZE)
+        b = tl.minimum(((score - t0) * BINS).to(tl.int32), BINS - 1)
+        included = valid & (b >= 0)
+        hist += tl.sum((b[:, None] == bins[None, :]) & included[:, None],
+                       axis=0).to(tl.int32)
     tl.store(HIST_SPLIT + base + bins, hist)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 5a – Halley accumulate
-# grid = (B, H, MAX_SPLITS)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 32},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=2),
-    ],
-    key=['H_DIM', 'USE_ALIBI', 'PAGE_SIZE'],
-)
 @triton.jit
 def _paged_stage5a_halley_accumulate(
-    Q, K_cache,
+    Q, K, BLOCK_TABLE, SELECTED, SEL_LENS, SEQ_LENS, SLOPES, TAUS,
     ACC0_SPLIT, ACC1_SPLIT, ACC2_SPLIT,
-    TAUS,
-    PAGE_INDICES,
-    Cache_seqlens,
-    Q_Seqlens,
-    ALIBI_SLOPES,
-    ##
-    alpha: tl.constexpr,
-    sm_scale: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    ##
-    N_H: tl.constexpr,
-    N_KVH: tl.constexpr,
-    H_DIM: tl.constexpr,
-    MAX_SPLITS: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    ##
-    stride_qh: tl.constexpr,
-    stride_kz: tl.constexpr,
-    stride_kh: tl.constexpr,
-    stride_csz: tl.constexpr,
-    stride_csh: tl.constexpr,
-    stride_th: tl.constexpr,
-    stride_ah: tl.constexpr,
-    stride_piz: tl.constexpr,
-    stride_pih: tl.constexpr,
-    ##
+    stride_qb: tl.constexpr, stride_qh: tl.constexpr,
+    stride_kblock: tl.constexpr, stride_ktok: tl.constexpr,
+    stride_kh: tl.constexpr, stride_kd: tl.constexpr,
+    stride_btb: tl.constexpr, stride_selb: tl.constexpr,
+    stride_selh: tl.constexpr, stride_lb: tl.constexpr,
+    alpha: tl.constexpr, sm_scale: tl.constexpr,
+    N_H: tl.constexpr, N_KVH: tl.constexpr, H_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, MAX_SPLITS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    _scalar = (alpha - 1) * sm_scale
     coeff_0 = 1 / (alpha - 1)
     coeff_1 = coeff_0 - 1
     coeff_2 = coeff_0 - 2
-    input_dtype = Q.dtype.element_ty
-
-    off_z    = tl.program_id(0)
-    off_h    = tl.program_id(1)
-    split_id = tl.program_id(2)
-    off_hz   = off_z * N_H + off_h
-    kv_h     = off_h if N_H == N_KVH else off_h // (N_H // N_KVH)
-
-    cache_seqlen     = tl.load(Cache_seqlens + off_z * stride_csz + kv_h * stride_csh).to(tl.int32)
-    seqlen_per_split = tl.cdiv(cache_seqlen, MAX_SPLITS)
-    split_start      = split_id * seqlen_per_split
-    split_end        = tl.minimum(split_start + seqlen_per_split, cache_seqlen)
-    if split_start >= cache_seqlen:
-        base = off_hz * MAX_SPLITS + split_id
-        tl.store(ACC0_SPLIT + base, 0.0)
-        tl.store(ACC1_SPLIT + base, 0.0)
-        tl.store(ACC2_SPLIT + base, 0.0)
+    req, head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hz = req * N_H + head
+    out = hz * MAX_SPLITS + split
+    start, end, total = _split_bounds(SEL_LENS, req, head, split, stride_lb,
+                                      MAX_SPLITS)
+    if start >= total:
+        tl.store(ACC0_SPLIT + out, 0.0)
+        tl.store(ACC1_SPLIT + out, 0.0)
+        tl.store(ACC2_SPLIT + out, 0.0)
         return
-
-    offs_k = tl.arange(0, H_DIM)
-    q      = tl.load(Q + off_hz * stride_qh + offs_k) * _scalar
-    q      = q.to(input_dtype)
-
-    alibi_slope = 0.0
-    if USE_ALIBI:
-        alibi_slope = tl.load(ALIBI_SLOPES + off_h) * (alpha - 1)
-    q_idx = tl.load(Q_Seqlens + off_z).to(tl.int32) - 1
-
-    t = tl.load(TAUS + off_hz * stride_th)
-
-    page_indices_base = PAGE_INDICES + off_z * stride_piz + kv_h * stride_pih
-    k_head_base       = K_cache + off_z * stride_kz + kv_h * stride_kh
-
-    acc0 = 0.0
-    acc1 = 0.0
-    acc2 = 0.0
-
+    kv_head = head // (N_H // N_KVH)
+    offs_d = tl.arange(0, H_DIM)
+    q, slope, q_pos = _load_query(Q, SLOPES, SEQ_LENS, req, head, offs_d,
+                                  stride_qb, stride_qh, alpha, sm_scale)
+    sel_base = SELECTED + req * stride_selb + head * stride_selh
+    bt_base = BLOCK_TABLE + req * stride_btb
+    t = tl.load(TAUS + hz)
+    acc0, acc1, acc2 = 0.0, 0.0, 0.0
     offs_n = tl.arange(0, BLOCK_N)
-    valid_blocks = tl.cdiv(split_end - split_start, BLOCK_N)
-
-    for c_block in range(valid_blocks):
-        c_idxs = split_start + c_block * BLOCK_N + offs_n
-        c_mask = c_idxs < split_end
-
-        page_ranks   = c_idxs // PAGE_SIZE
-        in_page_offs = c_idxs %  PAGE_SIZE
-        orig_pages   = tl.load(page_indices_base + page_ranks, mask=c_mask, other=0).to(tl.int32)
-        orig_rows    = orig_pages * PAGE_SIZE + in_page_offs
-
-        k_ptrs = k_head_base + orig_rows[:, None] * H_DIM + offs_k[None, :]
-        k = tl.load(k_ptrs, mask=c_mask[:, None], other=0.0).to(input_dtype)
-
-        qk = tl.sum(q[None, :] * k, axis=1)
-        if USE_ALIBI:
-            qk += alibi_slope * (-(q_idx - orig_rows))
-
-        qk_mask   = (qk > t) & c_mask
-        qk_mask_f = qk_mask.to(tl.float32)
-        qk_act    = (qk - t) * qk_mask_f
-
+    for block in range(tl.cdiv(end - start, BLOCK_N)):
+        compact = start + block * BLOCK_N + offs_n
+        score = _block_scores(q, slope, q_pos, compact, compact < end,
+                              sel_base, bt_base, K, kv_head, offs_d,
+                              stride_kblock, stride_ktok, stride_kh,
+                              stride_kd, BLOCK_SIZE)
+        mask = score > t
+        mask_f = mask.to(tl.float32)
+        act = tl.where(mask, score - t, 0.0)
         if alpha == 2.0:
-            acc0 += tl.sum(qk_act)
-            acc1 += tl.sum(qk_mask_f)
+            acc0 += tl.sum(act)
+            acc1 += tl.sum(mask_f)
         elif alpha == 1.5:
-            acc0 += tl.sum(qk_act * qk_act)
-            acc1 += tl.sum(qk_act)
-            acc2 += tl.sum(qk_mask_f)
+            acc0 += tl.sum(act * act)
+            acc1 += tl.sum(act)
+            acc2 += tl.sum(mask_f)
         else:
-            log2_act = tl.log2(qk_act)
-            acc0 += tl.sum(tl.where(qk_mask, tl.exp2(log2_act * coeff_0), 0.0))
-            acc1 += tl.sum(tl.where(qk_mask, tl.exp2(log2_act * coeff_1), 0.0))
-            acc2 += tl.sum(tl.where(qk_mask, tl.exp2(log2_act * coeff_2), 0.0))
-
-    base = off_hz * MAX_SPLITS + split_id
-    tl.store(ACC0_SPLIT + base, acc0)
-    tl.store(ACC1_SPLIT + base, acc1)
-    tl.store(ACC2_SPLIT + base, acc2)
+            log2_act = tl.log2(tl.where(mask, act, 1.0))
+            acc0 += tl.sum(tl.where(mask, tl.exp2(log2_act * coeff_0), 0.0))
+            acc1 += tl.sum(tl.where(mask, tl.exp2(log2_act * coeff_1), 0.0))
+            acc2 += tl.sum(tl.where(mask, tl.exp2(log2_act * coeff_2), 0.0))
+    tl.store(ACC0_SPLIT + out, acc0)
+    tl.store(ACC1_SPLIT + out, acc1)
+    tl.store(ACC2_SPLIT + out, acc2)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stage 6a – partial outputs per split
-# grid = (B, H, MAX_SPLITS)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 32},  num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 64},  num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=2),
-    ],
-    key=['H_DIM', 'USE_ALIBI', 'PAGE_SIZE'],
-)
 @triton.jit
 def _paged_stage6a_partial_out(
-    Q, K_cache, V_cache,
+    Q, K, V, BLOCK_TABLE, SELECTED, SEL_LENS, SEQ_LENS, SLOPES, TAUS,
     PARTIAL_OUT,
-    TAUS,
-    PAGE_INDICES,
-    Cache_seqlens,
-    Q_Seqlens,
-    ALIBI_SLOPES,
-    ##
-    alpha: tl.constexpr,
-    sm_scale: tl.constexpr,
-    USE_ALIBI: tl.constexpr,
-    ##
-    N_H: tl.constexpr,
-    N_KVH: tl.constexpr,
-    H_DIM: tl.constexpr,
-    MAX_SPLITS: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    ##
-    stride_qh: tl.constexpr,
-    stride_kz: tl.constexpr,
-    stride_kh: tl.constexpr,
-    stride_vz: tl.constexpr,
-    stride_vh: tl.constexpr,
-    stride_csz: tl.constexpr,
-    stride_csh: tl.constexpr,
-    stride_th: tl.constexpr,
-    stride_ah: tl.constexpr,
-    stride_piz: tl.constexpr,
-    stride_pih: tl.constexpr,
-    ##
+    stride_qb: tl.constexpr, stride_qh: tl.constexpr,
+    stride_kblock: tl.constexpr, stride_ktok: tl.constexpr,
+    stride_kh: tl.constexpr, stride_kd: tl.constexpr,
+    stride_vblock: tl.constexpr, stride_vtok: tl.constexpr,
+    stride_vh: tl.constexpr, stride_vd: tl.constexpr,
+    stride_btb: tl.constexpr, stride_selb: tl.constexpr,
+    stride_selh: tl.constexpr, stride_lb: tl.constexpr,
+    alpha: tl.constexpr, sm_scale: tl.constexpr,
+    N_H: tl.constexpr, N_KVH: tl.constexpr, H_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, MAX_SPLITS: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    _scalar = (alpha - 1) * sm_scale
     coeff_0 = 1 / (alpha - 1)
-    input_dtype = Q.dtype.element_ty
-
-    off_z    = tl.program_id(0)
-    off_h    = tl.program_id(1)
-    split_id = tl.program_id(2)
-    off_hz   = off_z * N_H + off_h
-    kv_h     = off_h if N_H == N_KVH else off_h // (N_H // N_KVH)
-
-    cache_seqlen     = tl.load(Cache_seqlens + off_z * stride_csz + kv_h * stride_csh).to(tl.int32)
-    q_idx            = tl.load(Q_Seqlens + off_z).to(tl.int32) - 1
-    seqlen_per_split = tl.cdiv(cache_seqlen, MAX_SPLITS)
-    split_start      = split_id * seqlen_per_split
-    split_end        = tl.minimum(split_start + seqlen_per_split, cache_seqlen)
-    offs_k = tl.arange(0, H_DIM)
-    if split_start >= cache_seqlen:
-        # PARTIAL_OUT is intentionally allocated with torch.empty. Fully
-        # define inactive splits here so the final reduction remains valid
-        # without a separate full-buffer zeroing launch.
-        partial_out_base = PARTIAL_OUT + (off_hz * MAX_SPLITS + split_id) * H_DIM
-        tl.store(partial_out_base + offs_k, 0.0)
+    req, head, split = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    hz = req * N_H + head
+    offs_d = tl.arange(0, H_DIM)
+    out_base = PARTIAL_OUT + (hz * MAX_SPLITS + split) * H_DIM
+    start, end, total = _split_bounds(SEL_LENS, req, head, split, stride_lb,
+                                      MAX_SPLITS)
+    if start >= total:
+        # PARTIAL_OUT is allocated with torch.empty: fully define idle splits.
+        tl.store(out_base + offs_d, tl.zeros((H_DIM,), dtype=tl.float32))
         return
-
-    q      = tl.load(Q + off_hz * stride_qh + offs_k) * _scalar
-    q      = q.to(input_dtype)
-
-    alibi_slope = 0.0
-    if USE_ALIBI:
-        alibi_slope = tl.load(ALIBI_SLOPES + off_h) * (alpha - 1)
-
-    t = tl.load(TAUS + off_hz * stride_th)
-
-    page_indices_base = PAGE_INDICES + off_z * stride_piz + kv_h * stride_pih
-    k_head_base       = K_cache + off_z * stride_kz + kv_h * stride_kh
-    v_head_base       = V_cache + off_z * stride_vz + kv_h * stride_vh
-
+    kv_head = head // (N_H // N_KVH)
+    q, slope, q_pos = _load_query(Q, SLOPES, SEQ_LENS, req, head, offs_d,
+                                  stride_qb, stride_qh, alpha, sm_scale)
+    sel_base = SELECTED + req * stride_selb + head * stride_selh
+    bt_base = BLOCK_TABLE + req * stride_btb
+    t = tl.load(TAUS + hz)
     acc = tl.zeros([H_DIM], dtype=tl.float32)
-
     offs_n = tl.arange(0, BLOCK_N)
-    valid_blocks = tl.cdiv(split_end - split_start, BLOCK_N)
-
-    for c_block in range(valid_blocks):
-        c_idxs = split_start + c_block * BLOCK_N + offs_n
-        c_mask = c_idxs < split_end
-
-        page_ranks   = c_idxs // PAGE_SIZE
-        in_page_offs = c_idxs %  PAGE_SIZE
-        orig_pages   = tl.load(page_indices_base + page_ranks, mask=c_mask, other=0).to(tl.int32)
-        orig_rows    = orig_pages * PAGE_SIZE + in_page_offs
-
-        k_ptrs = k_head_base + orig_rows[:, None] * H_DIM + offs_k[None, :]
-        k = tl.load(k_ptrs, mask=c_mask[:, None], other=0.0).to(input_dtype)
-
-        qk = tl.sum(q[None, :] * k, axis=1)
-        if USE_ALIBI:
-            qk += alibi_slope * (-(q_idx - orig_rows))
-
-        qk_mask = (qk > t) & c_mask
-
-        has_nonzero = tl.sum(qk_mask.to(tl.int32)) > 0
-        if has_nonzero:
-            v_ptrs = v_head_base + orig_rows[:, None] * H_DIM + offs_k[None, :]
-            v = tl.load(v_ptrs, mask=c_mask[:, None], other=0.0).to(input_dtype)
-
-            qk_act    = qk - t
-            qk_mask_f = qk_mask.to(tl.float32)
-
+    for block in range(tl.cdiv(end - start, BLOCK_N)):
+        compact = start + block * BLOCK_N + offs_n
+        valid = compact < end
+        score = _block_scores(q, slope, q_pos, compact, valid,
+                              sel_base, bt_base, K, kv_head, offs_d,
+                              stride_kblock, stride_ktok, stride_kh,
+                              stride_kd, BLOCK_SIZE)
+        mask = score > t
+        if tl.sum(mask.to(tl.int32)) > 0:
+            rank, token = compact // BLOCK_SIZE, compact % BLOCK_SIZE
+            logical = tl.load(sel_base + rank, mask=valid, other=0).to(tl.int32)
+            physical = tl.load(bt_base + logical, mask=valid,
+                               other=0).to(tl.int64)
+            v_rows = (physical * stride_vblock + token * stride_vtok
+                      + kv_head * stride_vh)
+            v = tl.load(V + v_rows[:, None] + offs_d[None, :] * stride_vd,
+                        mask=mask[:, None], other=0.0)
+            act = tl.where(mask, score - t, 0.0)
             if alpha == 2.0:
-                qk_proj = qk_act * qk_mask_f
+                prob = act
             elif alpha == 1.5:
-                qk_proj = qk_act * qk_act * qk_mask_f
+                prob = act * act
             else:
-                qk_proj = tl.where(qk_mask, tl.exp2(tl.log2(qk_act) * coeff_0), 0.0)
-
-            acc += tl.sum(v * qk_proj[:, None], axis=0)
-
-    partial_out_base = PARTIAL_OUT + (off_hz * MAX_SPLITS + split_id) * H_DIM
-    tl.store(partial_out_base + offs_k, acc.to(input_dtype))
+                prob = tl.where(mask, tl.exp2(tl.log2(tl.where(mask, act, 1.0))
+                                              * coeff_0), 0.0)
+            acc += tl.sum(v.to(tl.float32) * prob[:, None], axis=0)
+    tl.store(out_base + offs_d, acc)
 
 
-# ============================================================ #
-# Orchestrator: paged sparse attention decode
-# ============================================================ #
+class AdaDecodePagedWorkspace:
+    """Persistent, shape-keyed scratch for the generic-alpha decoder."""
 
-def make_adadecode_paged_workspace(
-    batch: int,
-    nheads: int,
-    dim: int,
-    max_splits: int,
-    bins: int,
-    *,
-    device,
-    dtype,
-):
-    """Allocate the intermediates for one exact paged-decode shape."""
-    return {
-        "_spec": (batch, nheads, dim, max_splits, bins, dtype, torch.device(device)),
-        "max_vals": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
-        "global_maxs": torch.empty((batch, nheads), device=device, dtype=torch.float32),
-        "hist_split": torch.empty((batch, nheads, max_splits, bins), device=device, dtype=torch.int32),
-        "hist_global": torch.empty((batch, nheads, bins), device=device, dtype=torch.int32),
-        "partial_out": torch.empty((batch, nheads, max_splits, dim), device=device, dtype=dtype),
-        "taus": torch.empty((batch, nheads), device=device, dtype=torch.float32),
-        "t_los": torch.empty((batch, nheads), device=device, dtype=torch.float32),
-        "t_his": torch.empty((batch, nheads), device=device, dtype=torch.float32),
-        "acc0_split": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
-        "acc1_split": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
-        "acc2_split": torch.empty((batch, nheads, max_splits), device=device, dtype=torch.float32),
-    }
+    def __init__(self):
+        self._cache: dict = {}
 
-
-def _validate_workspace(workspace, batch, nheads, dim, max_splits, bins, dtype, device):
-    expected_spec = (batch, nheads, dim, max_splits, bins, dtype, torch.device(device))
-    if workspace.get("_spec") == expected_spec:
-        return
-    expected = {
-        "max_vals": ((batch, nheads, max_splits), torch.float32),
-        "global_maxs": ((batch, nheads), torch.float32),
-        "hist_split": ((batch, nheads, max_splits, bins), torch.int32),
-        "hist_global": ((batch, nheads, bins), torch.int32),
-        "partial_out": ((batch, nheads, max_splits, dim), dtype),
-        "taus": ((batch, nheads), torch.float32),
-        "t_los": ((batch, nheads), torch.float32),
-        "t_his": ((batch, nheads), torch.float32),
-        "acc0_split": ((batch, nheads, max_splits), torch.float32),
-        "acc1_split": ((batch, nheads, max_splits), torch.float32),
-        "acc2_split": ((batch, nheads, max_splits), torch.float32),
-    }
-    for name, (shape, expected_dtype) in expected.items():
-        tensor = workspace.get(name)
-        if tensor is None or tuple(tensor.shape) != shape or tensor.dtype != expected_dtype or tensor.device != device:
-            raise ValueError(
-                f"invalid paged workspace {name}: expected {shape}/{expected_dtype}/{device}, "
-                f"got {None if tensor is None else (tuple(tensor.shape), tensor.dtype, tensor.device)}"
-            )
+    def get(self, batch: int, nheads: int, dim: int, device) -> dict:
+        key = (batch, nheads, dim, str(device))
+        ws = self._cache.get(key)
+        if ws is not None:
+            return ws
+        splits, bins = ADADECODE_SPLITS, ADADECODE_BINS
+        f32 = dict(device=device, dtype=torch.float32)
+        ws = {
+            "max_vals": torch.empty((batch, nheads, splits), **f32),
+            "global_maxs": torch.empty((batch, nheads), **f32),
+            "hist_split": torch.empty((batch, nheads, splits, bins),
+                                      device=device, dtype=torch.int32),
+            "hist_global": torch.empty((batch, nheads, bins), device=device,
+                                       dtype=torch.int32),
+            "partial_out": torch.empty((batch, nheads, splits, dim), **f32),
+            "taus": torch.empty((batch, nheads), **f32),
+            "t_los": torch.empty((batch, nheads), **f32),
+            "t_his": torch.empty((batch, nheads), **f32),
+            "acc0_split": torch.empty((batch, nheads, splits), **f32),
+            "acc1_split": torch.empty((batch, nheads, splits), **f32),
+            "acc2_split": torch.empty((batch, nheads, splits), **f32),
+        }
+        self._cache[key] = ws
+        return ws
 
 
-def sparse_attention_decode_paged(
-    q: torch.Tensor,            # [B, H, 1, D]
-    k_cache: torch.Tensor,      # [B, H_kv, S, D]  — full cache, never copied
-    v_cache: torch.Tensor,      # [B, H_kv, S, D]
-    out: torch.Tensor,          # [B, H, 1, D]
-    cache_seqlens: torch.Tensor,  # [B, H_kv] int32 — compacted token count per KV head
-    page_indices: torch.Tensor,   # [B, H_kv, n_pages] int32 — selected page ids
-    page_size: int,
-    alibi_slopes: torch.Tensor = None,
-    is_causal: bool = True,
-    alpha: float = 1.5,
+def entmax_decode_selected_pages_generic(
+    q: torch.Tensor,               # (B, H_q, D)
+    kv_cache: torch.Tensor,        # (2, num_blocks, block_size, H_kv, D)
+    block_table: torch.Tensor,     # (B, max_pages) int32
+    selected_pages: torch.Tensor,  # (B, H_q, n) int32, logical, -1 pad, tail last
+    sel_lens: torch.Tensor,        # (B, H_q) int32
+    seq_lens: torch.Tensor,        # (B,) int32
+    alpha: float,
+    alibi_slopes: torch.Tensor,    # (H_q,) by QUERY head
     niter: int = 10,
-    max_splits: int = 32,
-    bins: int = 16,
-    q_seqlens: torch.Tensor = None,
-    taus_out: torch.Tensor = None,  # optional [B, H] buffer to capture converged tau
-    workspace: dict = None,
-):
+    out: torch.Tensor | None = None,
+    workspace: AdaDecodePagedWorkspace | None = None,
+) -> torch.Tensor:
+    """Entmax decode over ``selected_pages`` for any alpha > 1.
+
+    Exact with respect to the selected set. Prefer
+    ``entmax_decode_selected_pages`` for alpha in {1.5, 2.0}.
     """
-    Page-native six-stage adadecode pipeline.
-
-    PAGE_INDICES is keyed by KV head. Under GQA the kernels map query head
-    h to KV head h // n_rep, so callers can pass raw KV-head caches and page
-    tables without materializing repeated heads.
-    cache_seqlens[b, kv_h] = n_selected_pages_for_head * page_size + last_page_size.
-    """
-    batch, nheads, _, dim = q.shape
-    num_kv_heads = k_cache.shape[1]
-    assert q.shape[2] == 1
-    assert page_indices.dtype == torch.int32
-    assert nheads % num_kv_heads == 0, "Query heads must be divisible by KV heads"
-    assert v_cache.shape[:2] == (batch, num_kv_heads), "K/V cache head shapes must match"
-    assert page_indices.shape[0] == batch, "page_indices batch mismatch"
-    assert page_indices.shape[1] == num_kv_heads, "page_indices must be keyed by KV heads"
-    if cache_seqlens.dim() == 1:
-        cache_seqlens = cache_seqlens[:, None].expand(batch, num_kv_heads)
-    assert cache_seqlens.shape == (batch, num_kv_heads), "cache_seqlens must be [B, H_kv]"
-
-    sm_scale   = 1.0 / math.sqrt(dim)
-    use_alibi  = alibi_slopes is not None
-    stride_ah  = alibi_slopes.stride(0) if use_alibi and alibi_slopes.dim() > 0 else 0
-
-    # q_seqlens holds the original full-sequence length for each batch element.
-    # Used to compute actual query token position for ALiBi biases.
-    # If None, fall back to cache_seqlens (no-op when ALiBi is disabled).
-    if q_seqlens is None:
-        q_seqlens = cache_seqlens
-
-    # Intermediates
+    if q.ndim != 3:
+        raise ValueError(f"q must have shape [B, H_q, D], got {tuple(q.shape)}")
+    if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
+        raise ValueError("kv_cache must be [2, num_blocks, block_size, H_kv, D]")
+    batch, nheads, dim = q.shape
+    _, _, block_size, n_kv_heads, cache_dim = kv_cache.shape
+    if dim != cache_dim or nheads % n_kv_heads:
+        raise ValueError("incompatible Q and paged KV head geometry")
+    if not alpha > 1.0:
+        raise ValueError("generic entmax decode requires alpha > 1")
+    if dim & (dim - 1):
+        raise ValueError("head dimension must be a power of two")
+    if selected_pages.shape[:2] != (batch, nheads):
+        raise ValueError("selected_pages must be [B, H_q, n] (by QUERY head)")
+    if sel_lens.shape != (batch, nheads):
+        raise ValueError("sel_lens must be [B, H_q]")
+    if selected_pages.dtype != torch.int32 or sel_lens.dtype != torch.int32:
+        raise TypeError("selected_pages and sel_lens must be int32")
+    if block_table.dtype != torch.int32 or seq_lens.dtype != torch.int32:
+        raise TypeError("block_table and seq_lens must be int32")
+    slopes = alibi_slopes.to(device=q.device, dtype=torch.float32)
+    if slopes.shape != (nheads,):
+        raise ValueError(f"alibi_slopes must have shape ({nheads},)")
+    if out is None:
+        out = torch.empty_like(q)
+    if out.stride(2) != 1 or out.stride(0) != nheads * out.stride(1):
+        # _decode_stage6b addresses OUT as (b*H + h) * stride_oh + d.
+        raise ValueError("out must have uniformly strided rows and unit last "
+                         "stride")
     if workspace is None:
-        workspace = make_adadecode_paged_workspace(
-            batch, nheads, dim, max_splits, bins, device=q.device, dtype=q.dtype
-        )
-    else:
-        _validate_workspace(
-            workspace, batch, nheads, dim, max_splits, bins, q.dtype, q.device
-        )
-
-    max_vals    = workspace["max_vals"]
-    global_maxs = workspace["global_maxs"]
-    hist_split  = workspace["hist_split"]
-    hist_global = workspace["hist_global"]
-    partial_out = workspace["partial_out"]
-    taus   = workspace["taus"]
-    t_los  = workspace["t_los"]
-    t_his  = workspace["t_his"]
-    acc0_split = workspace["acc0_split"]
-    acc1_split = workspace["acc1_split"]
-    acc2_split = workspace["acc2_split"]
-
-    # Strides
-    stride_qh  = q.stride(1)
-    stride_kz  = k_cache.stride(0)
-    stride_kh  = k_cache.stride(1)
-    stride_vz  = v_cache.stride(0)
-    stride_vh  = v_cache.stride(1)
-    stride_th  = taus.stride(1)
-    stride_oh  = out.stride(1)
-    stride_csz = cache_seqlens.stride(0)
-    stride_csh = cache_seqlens.stride(1)
-    stride_piz = page_indices.stride(0)
-    stride_pih = page_indices.stride(1)
-
-    # ---------------- Stage 1 ---------------- #
-    grid1 = (batch, nheads, max_splits)
-    _paged_stage1_local_max[grid1](
-        Q=q, K_cache=k_cache,
-        MAX_VALS=max_vals,
-        PAGE_INDICES=page_indices,
-        Cache_seqlens=cache_seqlens,
-        Q_Seqlens=q_seqlens,
-        ALIBI_SLOPES=alibi_slopes,
-        alpha=alpha, sm_scale=sm_scale,
-        USE_ALIBI=use_alibi,
-        N_H=nheads, N_KVH=num_kv_heads, H_DIM=dim, MAX_SPLITS=max_splits, PAGE_SIZE=page_size,
-        stride_qh=stride_qh, stride_kz=stride_kz, stride_kh=stride_kh,
-        stride_csz=stride_csz, stride_csh=stride_csh,
-        stride_ah=stride_ah, stride_piz=stride_piz, stride_pih=stride_pih,
+        workspace = AdaDecodePagedWorkspace()
+    ws = workspace.get(batch, nheads, dim, q.device)
+    splits, bins = ADADECODE_SPLITS, ADADECODE_BINS
+    k_cache, v_cache = kv_cache.unbind(0)
+    common = dict(
+        stride_qb=q.stride(0), stride_qh=q.stride(1),
+        stride_kblock=k_cache.stride(0), stride_ktok=k_cache.stride(1),
+        stride_kh=k_cache.stride(2), stride_kd=k_cache.stride(3),
+        stride_btb=block_table.stride(0),
+        stride_selb=selected_pages.stride(0),
+        stride_selh=selected_pages.stride(1), stride_lb=sel_lens.stride(0),
+        alpha=float(alpha), sm_scale=1.0 / math.sqrt(dim),
+        N_H=nheads, N_KVH=n_kv_heads, H_DIM=dim, BLOCK_SIZE=block_size,
+        MAX_SPLITS=splits, BLOCK_N=ADADECODE_BLOCK_N, num_warps=4,
     )
+    inputs = (q, k_cache, block_table, selected_pages, sel_lens, seq_lens,
+              slopes)
+    grid_bh, grid_bhs = (batch, nheads), (batch, nheads, splits)
+    stride_th = ws["taus"].stride(1)
 
-    # ---------------- Stage 2 ---------------- #
-    grid2 = (batch, nheads)
-    _decode_stage2_reduce_max[grid2](
-        MAX_VALS=max_vals, GLOBAL_MAXS=global_maxs,
-        N_H=nheads, MAX_SPLITS=max_splits,
-    )
-
-    # ---------------- Stage 3 ---------------- #
-    grid3 = (batch, nheads, max_splits)
-    _paged_stage3_build_hist[grid3](
-        Q=q, K_cache=k_cache,
-        GLOBAL_MAXS=global_maxs,
-        HIST_SPLIT=hist_split,
-        PAGE_INDICES=page_indices,
-        Cache_seqlens=cache_seqlens,
-        Q_Seqlens=q_seqlens,
-        ALIBI_SLOPES=alibi_slopes,
-        alpha=alpha, sm_scale=sm_scale,
-        USE_ALIBI=use_alibi,
-        N_H=nheads, N_KVH=num_kv_heads, H_DIM=dim, MAX_SPLITS=max_splits, BINS=bins, PAGE_SIZE=page_size,
-        stride_qh=stride_qh, stride_kz=stride_kz, stride_kh=stride_kh,
-        stride_csz=stride_csz, stride_csh=stride_csh,
-        stride_ah=stride_ah, stride_piz=stride_piz, stride_pih=stride_pih,
-    )
-
-    # ---------------- Stage 4 ---------------- #
-    grid4 = (batch, nheads)
-    _decode_stage4_reduce_hist[grid4](
-        HIST_SPLIT=hist_split, HIST_GLOBAL=hist_global,
-        N_H=nheads, MAX_SPLITS=max_splits, BINS=bins,
-    )
-
-    # ---------------- Stage 5 ---------------- #
-    gridBH  = (batch, nheads)
-    gridBHS = (batch, nheads, max_splits)
-
-    # 5-init: compute (t_lo, t_hi, t) from GLOBAL_MAXS + HIST_GLOBAL
-    _decode_stage5_init[gridBH](
-        GLOBAL_MAXS=global_maxs, HIST_GLOBAL=hist_global,
-        TAUS=taus, T_LOS=t_los, T_HIS=t_his,
-        alpha=alpha, BINS=bins, N_H=nheads, stride_th=stride_th,
-    )
-
-    # Halley iterations: (accumulate over splits) -> (update per head)
-    # usually just one is enough
-    for _ in range(niter):
-        _paged_stage5a_halley_accumulate[gridBHS](
-            Q=q, K_cache=k_cache,
-            ACC0_SPLIT=acc0_split, ACC1_SPLIT=acc1_split, ACC2_SPLIT=acc2_split,
-            TAUS=taus,
-            PAGE_INDICES=page_indices,
-            Cache_seqlens=cache_seqlens,
-            Q_Seqlens=q_seqlens,
-            ALIBI_SLOPES=alibi_slopes,
-            alpha=alpha, sm_scale=sm_scale,
-            USE_ALIBI=use_alibi,
-            N_H=nheads, N_KVH=num_kv_heads, H_DIM=dim, MAX_SPLITS=max_splits, PAGE_SIZE=page_size,
-            stride_qh=stride_qh, stride_kz=stride_kz, stride_kh=stride_kh,
-            stride_csz=stride_csz, stride_csh=stride_csh,
-            stride_th=stride_th, stride_ah=stride_ah, stride_piz=stride_piz, stride_pih=stride_pih,
-        )
-        _decode_stage5b_halley_update[gridBH](
-            TAUS=taus, T_LOS=t_los, T_HIS=t_his,
-            ACC0_SPLIT=acc0_split, ACC1_SPLIT=acc1_split, ACC2_SPLIT=acc2_split,
-            alpha=alpha, N_H=nheads, MAX_SPLITS=max_splits, stride_th=stride_th,
-        )
-
-    if taus_out is not None:
-        taus_out.copy_(taus)
-
-    # ---------------- Stage 6a ---------------- #
-    grid6a = (batch, nheads, max_splits)
-    _paged_stage6a_partial_out[grid6a](
-        Q=q, K_cache=k_cache, V_cache=v_cache,
-        PARTIAL_OUT=partial_out,
-        TAUS=taus,
-        PAGE_INDICES=page_indices,
-        Cache_seqlens=cache_seqlens,
-        Q_Seqlens=q_seqlens,
-        ALIBI_SLOPES=alibi_slopes,
-        alpha=alpha, sm_scale=sm_scale,
-        USE_ALIBI=use_alibi,
-        N_H=nheads, N_KVH=num_kv_heads, H_DIM=dim, MAX_SPLITS=max_splits, PAGE_SIZE=page_size,
-        stride_qh=stride_qh, stride_kz=stride_kz, stride_kh=stride_kh,
-        stride_vz=stride_vz, stride_vh=stride_vh,
-        stride_csz=stride_csz, stride_csh=stride_csh,
-        stride_th=stride_th, stride_ah=stride_ah, stride_piz=stride_piz, stride_pih=stride_pih,
-    )
-
-    # ---------------- Stage 6b ---------------- #
-    _decode_stage6b_reduce_partials[grid4](
-        PARTIAL_OUT=partial_out, OUT=out,
-        N_H=nheads, H_DIM=dim, MAX_SPLITS=max_splits, stride_oh=stride_oh,
-    )
-
+    _paged_stage1_local_max[grid_bhs](*inputs, ws["max_vals"], **common)
+    _decode_stage2_reduce_max[grid_bh](
+        MAX_VALS=ws["max_vals"], GLOBAL_MAXS=ws["global_maxs"],
+        N_H=nheads, MAX_SPLITS=splits)
+    _paged_stage3_build_hist[grid_bhs](
+        *inputs, ws["global_maxs"], ws["hist_split"], BINS=bins, **common)
+    _decode_stage4_reduce_hist[grid_bh](
+        HIST_SPLIT=ws["hist_split"], HIST_GLOBAL=ws["hist_global"],
+        N_H=nheads, MAX_SPLITS=splits, BINS=bins)
+    _decode_stage5_init[grid_bh](
+        GLOBAL_MAXS=ws["global_maxs"], HIST_GLOBAL=ws["hist_global"],
+        TAUS=ws["taus"], T_LOS=ws["t_los"], T_HIS=ws["t_his"],
+        alpha=float(alpha), BINS=bins, N_H=nheads, stride_th=stride_th)
+    for _ in range(int(niter)):
+        _paged_stage5a_halley_accumulate[grid_bhs](
+            *inputs, ws["taus"], ws["acc0_split"], ws["acc1_split"],
+            ws["acc2_split"], **common)
+        _decode_stage5b_halley_update[grid_bh](
+            TAUS=ws["taus"], T_LOS=ws["t_los"], T_HIS=ws["t_his"],
+            ACC0_SPLIT=ws["acc0_split"], ACC1_SPLIT=ws["acc1_split"],
+            ACC2_SPLIT=ws["acc2_split"], alpha=float(alpha), N_H=nheads,
+            MAX_SPLITS=splits, stride_th=stride_th)
+    q_, k_, bt_, sel_, lens_, seqs_, slopes_ = inputs
+    _paged_stage6a_partial_out[grid_bhs](
+        q_, k_, v_cache, bt_, sel_, lens_, seqs_, slopes_, ws["taus"],
+        ws["partial_out"],
+        stride_vblock=v_cache.stride(0), stride_vtok=v_cache.stride(1),
+        stride_vh=v_cache.stride(2), stride_vd=v_cache.stride(3), **common)
+    _decode_stage6b_reduce_partials[grid_bh](
+        PARTIAL_OUT=ws["partial_out"], OUT=out, N_H=nheads, H_DIM=dim,
+        MAX_SPLITS=splits, stride_oh=out.stride(1))
     return out

@@ -26,7 +26,7 @@ def _truncated_moments(
     m2 = (mu_y.square() + sigma_y.square()) * Phi + mu_y * sigma_y * phi
     m3 = (
         (mu_y.pow(3) + 3.0 * mu_y * sigma_y.square()) * Phi
-        + (sigma_y.pow(3) + 2.0 * mu_y.square() * sigma_y) * phi
+        + (mu_y.square() * sigma_y + 2.0 * sigma_y.pow(3)) * phi
     )
     return m0, m1, m2, m3
 

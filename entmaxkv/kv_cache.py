@@ -1,256 +1,240 @@
+"""Paged KV cache in vLLM's block layout, with per-page key statistics.
+
+Storage matches vLLM's attention backend:
+
+    kv           [2, num_blocks, page_size, H_kv, D]    (K = kv[0], V = kv[1])
+    block_table  int32 [B, max_pages]                    logical -> physical
+    seq_lens     int32 [B]                               ragged rows allowed
+
+entmaxkv owns the whole pool, so the block table is the identity
+``block_table[b, p] = b * max_pages + p``. Page statistics are indexed by
+PHYSICAL block and refreshed in place, only for the blocks a write touches:
+
+    k_min, k_max    [num_blocks, H_kv, D]  cache dtype   (top-k criticality)
+    k_mean, k_std   [num_blocks, H_kv, D]  fp32          (Gaussian selection)
+
+Appends write one slot per row in place. Capacity grows geometrically when a
+row outgrows it; every kernel constant derived from strides changes at that
+point, so pass ``max_seq_len`` to size the pool up front and avoid the
+one-off recompiles.
+"""
+
+from typing import Iterable, Optional, Sequence
+
 import torch
-from typing import Optional
 
-try:
-    from entmaxkv.kernels.page_criticality import triton_estimate_page_criticality
-except Exception:
-    triton_estimate_page_criticality = None
+from entmaxkv.kernels.gaussian.page_metadata import (
+    allocate_gaussian_page_metadata,
+    update_gaussian_page_metadata,
+)
+from entmaxkv.kernels.page_metadata import (
+    allocate_page_metadata,
+    update_completed_page_metadata,
+)
 
-try:
-    from entmaxkv.kernels.selection_pack import select_gaussian_threshold_pack_triton
-except Exception:
-    select_gaussian_threshold_pack_triton = None
-
+STATS = ("topk", "gaussian")
+# Extra pages allocated past the prefill when no max_seq_len is given.
+DEFAULT_SLACK_PAGES = 64
 
 
 class PagedKVCache:
-    """
-    KV Cache with paged metadata tracking for criticality estimation.
+    """KV cache with paged key statistics for query-aware page selection."""
 
-    Maintains min/max/mean/std statistics per page for efficient query-aware sparsity.
-    """
-
-    def __init__(self, page_size: int = 16):
+    def __init__(self, page_size: int = 16,
+                 stats: Iterable[str] = STATS,
+                 max_seq_len: Optional[int] = None):
+        if page_size < 1 or page_size & (page_size - 1):
+            raise ValueError("page_size must be a positive power of two")
+        stats = tuple(stats)
+        unknown = set(stats) - set(STATS)
+        if unknown:
+            raise ValueError(f"unknown stats {sorted(unknown)}; "
+                             f"expected a subset of {STATS}")
         self.page_size = page_size
-        self.k_cache = None
-        self.v_cache = None
-        self.k_min = None
-        self.k_max = None
-        self.k_mean = None
-        self.k_std = None
+        self.stats = stats
+        self.requested_max_seq_len = max_seq_len
+        self.kv: Optional[torch.Tensor] = None
+        self.block_table: Optional[torch.Tensor] = None
+        self.seq_lens: Optional[torch.Tensor] = None
+        self.k_min = self.k_max = None
+        self.k_mean = self.k_std = None
+        self._seq_lens_host: list[int] = []
+        self._row_base: Optional[torch.Tensor] = None
+        # Decode scratch owned by this cache (selectors, kernel workspaces).
+        self.workspaces: dict = {}
 
-        self.last_num_selected_per_head = None
+    # ---- geometry -----------------------------------------------------------
 
-        # Persistent decode-step buffers, reused across calls to avoid
-        # per-step allocation churn.
-        self._page_indices_buf: Optional[torch.Tensor] = None
-        self._page_indices_last_page: Optional[int] = None
-        self._paged_decode_workspaces: dict = {}
+    @property
+    def batch(self) -> int:
+        return self.block_table.shape[0]
 
-    def initialize(self, k: torch.Tensor, v: torch.Tensor):
-        """Initialize cache with prefill keys/values."""
-        batch, num_heads, seq_len, head_dim = k.shape
+    @property
+    def max_pages(self) -> int:
+        return self.block_table.shape[1]
 
-        self.k_cache = k.clone()
-        self.v_cache = v.clone()
+    @property
+    def num_kv_heads(self) -> int:
+        return self.kv.shape[3]
 
-        # Compute initial min/max/mean/std statistics per page
-        num_pages = (seq_len + self.page_size - 1) // self.page_size
-        self.k_min = torch.zeros(batch, num_heads, num_pages, head_dim,
-                                 dtype=k.dtype, device=k.device)
-        self.k_max = torch.zeros(batch, num_heads, num_pages, head_dim,
-                                 dtype=k.dtype, device=k.device)
-        self.k_mean = torch.zeros(batch, num_heads, num_pages, head_dim,
-                                  dtype=k.dtype, device=k.device)
-        self.k_std = torch.zeros(batch, num_heads, num_pages, head_dim,
-                                 dtype=k.dtype, device=k.device)
+    @property
+    def head_dim(self) -> int:
+        return self.kv.shape[4]
 
-        for page_idx in range(num_pages):
-            start_idx = page_idx * self.page_size
-            end_idx = min(start_idx + self.page_size, seq_len)
-            page_keys = k[:, :, start_idx:end_idx, :]
+    @property
+    def seq_lens_host(self) -> tuple[int, ...]:
+        """Row lengths, tracked on the host so decode never syncs for them."""
+        return tuple(self._seq_lens_host)
 
-            self.k_min[:, :, page_idx, :] = page_keys.min(dim=2)[0]
-            self.k_max[:, :, page_idx, :] = page_keys.max(dim=2)[0]
-            self.k_mean[:, :, page_idx, :] = page_keys.mean(dim=2)
+    @property
+    def max_seq_len(self) -> int:
+        return max(self._seq_lens_host)
 
-            # Compute std with unbiased=False to handle pages with few tokens
-            page_std = page_keys.std(dim=2, unbiased=False)
-            # Clamp to avoid snumerical issues
-            self.k_std[:, :, page_idx, :] = page_std.clamp(min=1e-6)
+    @property
+    def live_pages(self) -> int:
+        """Block-table columns any row currently uses."""
+        return -(-self.max_seq_len // self.page_size)
 
-    def append(self, k_new: torch.Tensor, v_new: torch.Tensor):
-        """
-        Append new tokens to cache and update metadata.
+    @property
+    def k_cache(self) -> torch.Tensor:
+        """[num_blocks, page_size, H_kv, D] view of K."""
+        return self.kv[0]
 
-        Args:
-            k_new: [batch, num_heads, 1, head_dim]
-            v_new: [batch, num_heads, 1, head_dim]
-        """
-        # Append to cache
-        self.k_cache = torch.cat([self.k_cache, k_new], dim=2)
-        self.v_cache = torch.cat([self.v_cache, v_new], dim=2)
+    @property
+    def v_cache(self) -> torch.Tensor:
+        return self.kv[1]
 
-        # Update min/max/mean/std for the last page
-        seq_len = self.k_cache.shape[2]
-        page_idx = (seq_len - 1) // self.page_size
+    # ---- allocation ---------------------------------------------------------
 
-        if page_idx >= self.k_min.shape[2]:
-            batch, num_heads, _, head_dim = self.k_cache.shape
-            new_page_min = torch.zeros(batch, num_heads, 1, head_dim,
-                                       dtype=k_new.dtype, device=k_new.device)
-            new_page_max = torch.zeros(batch, num_heads, 1, head_dim,
-                                       dtype=k_new.dtype, device=k_new.device)
-            new_page_mean = torch.zeros(batch, num_heads, 1, head_dim,
-                                        dtype=k_new.dtype, device=k_new.device)
-            new_page_std = torch.zeros(batch, num_heads, 1, head_dim,
-                                       dtype=k_new.dtype, device=k_new.device)
-            self.k_min = torch.cat([self.k_min, new_page_min], dim=2)
-            self.k_max = torch.cat([self.k_max, new_page_max], dim=2)
-            self.k_mean = torch.cat([self.k_mean, new_page_mean], dim=2)
-            self.k_std = torch.cat([self.k_std, new_page_std], dim=2)
+    def _allocate(self, batch, heads, dim, dtype, device, max_pages):
+        ps = self.page_size
+        self.kv = torch.zeros((2, batch * max_pages, ps, heads, dim),
+                              dtype=dtype, device=device)
+        rows = torch.arange(batch, device=device, dtype=torch.int32)
+        cols = torch.arange(max_pages, device=device, dtype=torch.int32)
+        self.block_table = (rows[:, None] * max_pages + cols[None, :]
+                            ).contiguous()
+        self._row_base = rows.to(torch.int64) * max_pages
+        if "topk" in self.stats:
+            self.k_min, self.k_max = allocate_page_metadata(self.kv)
+        if "gaussian" in self.stats:
+            self.k_mean, self.k_std = allocate_gaussian_page_metadata(self.kv)
 
-        # Update min/max/mean/std for current page
-        start_idx = page_idx * self.page_size
-        end_idx = seq_len
-        page_keys = self.k_cache[:, :, start_idx:end_idx, :]
+    def _grow(self, needed_pages: int) -> None:
+        """Re-home every row into a larger pool (one O(S) copy, amortised)."""
+        old_pages = self.max_pages
+        new_pages = max(needed_pages, old_pages + old_pages // 2)
+        old = {"kv": self.kv, "k_min": self.k_min, "k_max": self.k_max,
+               "k_mean": self.k_mean, "k_std": self.k_std}
+        batch, heads, dim = self.batch, self.num_kv_heads, self.head_dim
+        self._allocate(batch, heads, dim, self.kv.dtype, self.kv.device,
+                       new_pages)
+        ps = self.page_size
+        self.kv.view(2, batch, new_pages, ps, heads, dim)[:, :, :old_pages] \
+            .copy_(old["kv"].view(2, batch, old_pages, ps, heads, dim))
+        for name in ("k_min", "k_max", "k_mean", "k_std"):
+            if old[name] is not None:
+                getattr(self, name).view(batch, new_pages, heads, dim)[
+                    :, :old_pages].copy_(
+                        old[name].view(batch, old_pages, heads, dim))
+        self.workspaces.clear()
 
-        self.k_min[:, :, page_idx, :] = page_keys.min(dim=2)[0]
-        self.k_max[:, :, page_idx, :] = page_keys.max(dim=2)[0]
-        self.k_mean[:, :, page_idx, :] = page_keys.mean(dim=2)
+    def _refresh_stats(self, slot_mapping: torch.Tensor) -> None:
+        if self.k_min is not None:
+            update_completed_page_metadata(self.kv, slot_mapping,
+                                           self.k_min, self.k_max)
+        if self.k_mean is not None:
+            update_gaussian_page_metadata(self.kv, slot_mapping,
+                                          self.k_mean, self.k_std)
 
-        # Compute std with unbiased=False to handle single-element pages
-        # For single element pages, std will be 0 which is correct
-        page_std = page_keys.std(dim=2, unbiased=False)
-        # Clamp to avoid exact zeros which can cause numerical issues
-        self.k_std[:, :, page_idx, :] = page_std.clamp(min=1e-6)
+    # ---- writes -------------------------------------------------------------
 
-    def estimate_page_criticality(self, q: torch.Tensor,
-                                    use_triton: bool = False,
-                                    alibi_slopes=None,
-                                    q_pos: int = 0,
-                                    exclude_last_page: bool = False) -> torch.Tensor:
-        """
-        Estimate criticality scores for each page given a query.
-
-        score = sum_i max(q_i * min_i, q_i * max_i) [/ sqrt(d_head)]
-                [+ alibi_slopes[h] * (min((p+1)*page_size-1, seq_len-1) - q_pos)]
+    def initialize(self, k: torch.Tensor, v: torch.Tensor,
+                   seq_lens: Optional[Sequence[int]] = None) -> None:
+        """Load a prefill.
 
         Args:
-            q: Query tensor [batch, heads, 1, head_dim] or [batch, heads, pages, head_dim]
-            apply_scaling: If True, apply attention scaling 1/sqrt(d_head) (default: False)
-            use_triton: If True, use fused Triton kernel (default: False)
-            alibi_slopes: [num_heads] float32 raw slopes; bonus computed in-kernel or Python-side.
-            q_pos: absolute position of the query token (seq_len - 1).
-            exclude_last_page: drop the in-progress last page from scoring.
-
-        Returns:
-            page_scores: Upper bound scores per page [batch, heads, pages]
+            k, v: [B, H_kv, S, D].
+            seq_lens: optional per-row lengths (<= S) for ragged batches;
+                positions past a row's length are ignored.
         """
-        if use_triton:
-            return triton_estimate_page_criticality(
-                q, self.k_min, self.k_max,
-                alibi_slopes=alibi_slopes,
-                q_pos=q_pos,
-                page_size=self.page_size,
-                seq_len=self.k_cache.shape[2],
-                exclude_last_page=exclude_last_page,
-            )
+        if k.ndim != 4 or k.shape != v.shape:
+            raise ValueError("k and v must both be [B, H_kv, S, D]")
+        batch, heads, seq, dim = k.shape
+        if seq_lens is None:
+            lens = [seq] * batch
+        else:
+            lens = [int(x) for x in (seq_lens.tolist()
+                                     if torch.is_tensor(seq_lens)
+                                     else seq_lens)]
+        if len(lens) != batch or min(lens) < 1 or max(lens) > seq:
+            raise ValueError("seq_lens must hold B lengths in [1, S]")
+        ps = self.page_size
+        pages = -(-seq // ps)
+        # Room for decode: at least one more token, plus slack or the
+        # requested ceiling.
+        needed = -(-(max(lens) + 1) // ps)
+        if self.requested_max_seq_len is not None:
+            capacity = max(needed, -(-self.requested_max_seq_len // ps))
+        else:
+            capacity = needed + DEFAULT_SLACK_PAGES
+        capacity = max(capacity, pages)
+        self._allocate(batch, heads, dim, k.dtype, k.device, capacity)
+        self.workspaces.clear()
 
-        k_min = self.k_min[:, :, :-1, :] if exclude_last_page else self.k_min
-        k_max = self.k_max[:, :, :-1, :] if exclude_last_page else self.k_max
-        upper_bound = torch.maximum(q * k_min, q * k_max)
-        page_scores = upper_bound.sum(dim=-1)
+        positions = torch.arange(pages * ps, device=k.device)
+        lens_dev = torch.tensor(lens, device=k.device, dtype=torch.int64)
+        valid = (positions[None, :] < lens_dev[:, None])       # [B, pages*ps]
+        view = self.kv.view(2, batch, capacity, ps, heads, dim)
+        for idx, src in enumerate((k, v)):
+            padded = src.new_zeros((batch, pages * ps, heads, dim))
+            padded[:, :seq] = src.transpose(1, 2)
+            padded.mul_(valid[:, :, None, None].to(src.dtype))
+            view[idx, :, :pages].copy_(
+                padded.view(batch, pages, ps, heads, dim))
 
-        if alibi_slopes is not None:
-            seq_len = self.k_cache.shape[2]
-            num_pages = page_scores.shape[2]
-            page_last_pos = torch.clamp(
-                torch.arange(num_pages, device=q.device, dtype=torch.float32) * self.page_size + self.page_size - 1,
-                max=seq_len - 1,
-            )
-            alibi_bonus = alibi_slopes.float().view(1, -1, 1) * (page_last_pos - q_pos)
-            page_scores = page_scores + alibi_bonus
+        self.seq_lens = lens_dev.to(torch.int32)
+        self._seq_lens_host = lens
+        # One representative slot per touched block: the refresh kernels
+        # reduce the whole block regardless of which slot named it.
+        page_ids = torch.arange(pages, device=k.device)
+        touched = page_ids[None, :] < ((lens_dev + ps - 1) // ps)[:, None]
+        blocks = (self._row_base[:, None] + page_ids[None, :])[touched]
+        self._refresh_stats((blocks * ps).contiguous())
 
-        return page_scores
+    def append(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
+        """Append one token per row. k_new, v_new: [B, H_kv, 1, D]."""
+        if self.kv is None:
+            raise RuntimeError("initialize() the cache before appending")
+        expected = (self.batch, self.num_kv_heads, 1, self.head_dim)
+        if tuple(k_new.shape) != expected or tuple(v_new.shape) != expected:
+            raise ValueError(f"k_new and v_new must be {expected}")
+        needed = -(-(self.max_seq_len + 1) // self.page_size)
+        if needed > self.max_pages:
+            self._grow(needed)
+        ps = self.page_size
+        lens = self.seq_lens.to(torch.int64)
+        slots = (self._row_base + lens // ps) * ps + lens % ps
+        heads, dim = self.num_kv_heads, self.head_dim
+        self.kv[0].view(-1, heads, dim).index_copy_(0, slots, k_new[:, :, 0])
+        self.kv[1].view(-1, heads, dim).index_copy_(0, slots, v_new[:, :, 0])
+        self._refresh_stats(slots)
+        self.seq_lens += 1
+        self._seq_lens_host = [n + 1 for n in self._seq_lens_host]
 
-    def get_page_indices_buf(
-        self, batch: int, num_heads: int, num_pages_to_select: int, last_page_idx: int
-    ) -> torch.Tensor:
-        """Return a persistent [B, H, n_selected+1] page-indices buffer.
+    # ---- inspection ---------------------------------------------------------
 
-        Avoids a torch.empty + fill_ every decode step. During autoregressive
-        decode the last page changes only once per page_size steps, so the
-        fill_ for the sentinel column is skipped on the other steps.
-        """
-        target_shape = (batch, num_heads, num_pages_to_select + 1)
-        buf = self._page_indices_buf
-        if buf is None or tuple(buf.shape) != target_shape or buf.device != self.k_cache.device:
-            buf = torch.empty(target_shape, dtype=torch.int32, device=self.k_cache.device)
-            self._page_indices_buf = buf
-            self._page_indices_last_page = None
-        if self._page_indices_last_page != last_page_idx:
-            buf[:, :, num_pages_to_select].fill_(last_page_idx)
-            self._page_indices_last_page = last_page_idx
-        return buf
-
-    def get_paged_decode_workspace(
-        self, batch: int, nheads: int, dim: int, max_splits: int, bins: int,
-        dtype: torch.dtype, device: torch.device,
-    ) -> dict:
-        """Return a persistent workspace for one exact paged-kernel shape."""
-        device = torch.device(device)
-        key = (batch, nheads, dim, max_splits, bins, dtype, device.type, device.index)
-        workspace = self._paged_decode_workspaces.get(key)
-        if workspace is None:
-            from entmaxkv.kernels.adadecode_paged import (
-                make_adadecode_paged_workspace,
-            )
-            workspace = make_adadecode_paged_workspace(
-                batch, nheads, dim, max_splits, bins, device=device, dtype=dtype
-            )
-            self._paged_decode_workspaces[key] = workspace
-        return workspace
-
-    def select_gaussian_aware(self, q: torch.Tensor, alpha: float = 1.5, safety_margin_z: float = 0.0,
-                               max_quantile: float = 0.99,
-                               gaussian_stats: dict = None):
-        """
-        Returns selected_page_indices: [B, H, max_selected_pages].
-        Slots beyond num_selected_per_head[b, h] are zero (uninitialized) — callers must
-        use last_num_selected_per_head to know the valid length per head.
-        The last page (most recent) is always included via an inf sentinel.
-        Also stores self.last_page_scores and self.last_selected_page_indices.
-
-        safety_margin_z: dimensionless z-score margin. Lowers the effective score threshold by
-            safety_margin_z * σ_global, i.e. Δ = safety_margin_z * σ_global * (α-1) in τ-space.
-            Scale-invariant: 0.5 means "include tokens within half a global σ of the entmax cut-off".
-
-        alibi_slopes: [H] or [B, H] tensor of ALiBi slopes. When provided:
-            - μ_global is shifted by slope*(mean_k_pos - q_pos)
-        """
-        mu_scores_per_page = gaussian_stats["mu_scores_per_page"]
-        sigma_scores_per_page = gaussian_stats["sigma_scores_per_page"]
-        sigma_global = gaussian_stats["sigma_global"]
-        pages_for_stats = gaussian_stats["pages_for_stats"]
-        num_pages = gaussian_stats["num_pages"]
-        safety_margin_z = gaussian_stats["safety_margin_z"]
-        threshold_excess_margin_fraction = gaussian_stats.get("threshold_excess_margin_fraction", 0.1)
-        max_quantile = gaussian_stats["max_quantile"]
-        self.last_effective_safety_margin = safety_margin_z
-        self.last_effective_max_quantile  = max_quantile
-
-        assert select_gaussian_threshold_pack_triton is not None, "select_gaussian_threshold_pack_triton kernel not available"
-        assert q.is_cuda, "q must be on CUDA"
-        assert mu_scores_per_page.is_cuda, "mu_scores_per_page must be on CUDA"
-        assert sigma_scores_per_page.is_cuda, "sigma_scores_per_page must be on CUDA"
-
-        selected_page_indices, num_selected_per_head, tau_floor = (
-            select_gaussian_threshold_pack_triton(
-                mu_scores_per_page=mu_scores_per_page,
-                sigma_scores_per_page=sigma_scores_per_page,
-                tau_hat=gaussian_stats["tau_hat"],
-                sigma_global=sigma_global,
-                page_size=self.page_size,
-                alpha=alpha,
-                safety_margin_z=safety_margin_z,
-                max_quantile=max_quantile,
-                threshold_excess_margin_fraction=threshold_excess_margin_fraction,
-                pages_for_stats=pages_for_stats,
-                num_pages=num_pages,
-            )
-        )
-        gaussian_stats["tau_floor"] = tau_floor.contiguous()
-        self.last_num_selected_per_head = num_selected_per_head
-        return selected_page_indices, num_selected_per_head
-
+    def dense(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """[B, H_kv, max_seq_len, D] copies of K and V (zeros past a row's
+        length). For tests and references; never on the decode path."""
+        batch, heads, dim, ps = (self.batch, self.num_kv_heads,
+                                 self.head_dim, self.page_size)
+        seq = self.max_seq_len
+        pages = -(-seq // ps)
+        view = self.kv.view(2, batch, self.max_pages, ps, heads, dim)
+        dense = view[:, :, :pages].reshape(2, batch, pages * ps, heads, dim)
+        dense = dense[:, :, :seq].transpose(2, 3).clone()
+        positions = torch.arange(seq, device=dense.device)
+        valid = positions[None, :] < self.seq_lens.to(torch.int64)[:, None]
+        dense.mul_(valid[None, :, None, :, None].to(dense.dtype))
+        return dense[0], dense[1]

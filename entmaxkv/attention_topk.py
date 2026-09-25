@@ -1,8 +1,15 @@
 import torch
 from typing import Optional
 
-from entmaxkv.kernels.adadecode_paged import sparse_attention_decode_paged as _paged_kernel
+from entmaxkv.decoding import (
+    decode_exact,
+    decode_on_selection,
+    decode_views,
+    query_slopes,
+    workspace,
+)
 from entmaxkv.kv_cache import PagedKVCache
+from entmaxkv.selectors import TopKPageSelector, topk_is_worthwhile
 
 
 def sparse_attention_decode_paged(
@@ -11,90 +18,54 @@ def sparse_attention_decode_paged(
     k_new: torch.Tensor,
     v_new: torch.Tensor,
     out: torch.Tensor,
-    token_budget: int,
-    cache_seqlens: torch.Tensor,
-    q_seqlens: torch.Tensor,
-    alibi_slopes: torch.Tensor = None,
+    topk_pages: int,
+    alibi_slopes: Optional[torch.Tensor] = None,
     alpha: float = 1.5,
-    splits: int = 32,
-    niter: int = 10,
+    niter: Optional[int] = None,
     append_cache: bool = True,
-    use_triton_criticality: bool = True,
-    workspace: dict = None,
-):
+    min_context: int = 0,
+) -> torch.Tensor:
     """
-    Decode-phase attention with top-k page selection.
+    Decode-phase entmax attention over the top-k pages per query head.
 
-    Page-native variant: K/V are never gathered into a contiguous buffer.
-    The kernel receives PAGE_INDICES [B, H, n_pages] and accesses the full
-    cache directly, computing orig_row = page_id * page_size + in_page_offset
-    on the fly. 
+    Pages are ranked by a Quest-style upper bound on their best score
+    (per-page key extrema, 1/sqrt(d)-scaled, ALiBi at the page's best logical
+    position). Selection is per QUERY head; K/V stay compact under GQA.
+
+    Args:
+        q, out: [B, H_q, 1, D].
+        k_new, v_new: [B, H_kv, 1, D], appended first when ``append_cache``.
+        topk_pages: TOTAL pages attended per query head, including the
+            always-attended tail page (>= 2).
+        alibi_slopes: [H_q] slopes by query head, or None.
+        niter: tau refinements (default: 3 for alpha=1.5, 4 for alpha=2,
+            10 on the generic-alpha path).
+        min_context: rows shorter than this decode exactly.
+
+    The whole batch decodes exactly when any row is below ``min_context`` or
+    has no more pages than the budget: sparse selection would not save work.
+    The result is exact with respect to the selected pages.
     """
-    batch, num_heads, _, head_dim = q.shape
-    num_kv_heads = kv_cache.k_cache.shape[1]
-
+    if topk_pages < 2:
+        raise ValueError("topk_pages is tail inclusive and must be >= 2")
+    if min_context < 0:
+        raise ValueError("min_context must be >= 0")
     if append_cache:
         kv_cache.append(k_new, v_new)
-
-    seq_len    = kv_cache.k_cache.shape[2]
-    page_size  = kv_cache.page_size
-    total_pages = (seq_len + page_size - 1) // page_size
-    num_pages_to_select = min(token_budget // page_size, total_pages - 1)
-
-    last_page_idx = total_pages - 1
-
-    page_scores = kv_cache.estimate_page_criticality(
-        q,
-        use_triton=use_triton_criticality,
-        alibi_slopes=alibi_slopes,
-        q_pos=seq_len - 1,
-        exclude_last_page=True,
-    )
-
-    _, top_k_page_indices = torch.topk(page_scores, num_pages_to_select, dim=2)
-    top_k_page_indices = top_k_page_indices.to(torch.int32)
-
-    # Append last page as the final entry: [B, H, n_selected+1].
-    # Re-use a cached buffer when kv_cache supports it (OptimizedKVCache),
-    # otherwise fall back to a fresh allocation.
-    if hasattr(kv_cache, 'get_page_indices_buf'):
-        page_indices = kv_cache.get_page_indices_buf(
-            batch, num_heads, num_pages_to_select, last_page_idx
-        )
-    else:
-        page_indices = torch.empty(
-            (batch, num_heads, num_pages_to_select + 1),
-            dtype=torch.int32,
-            device=q.device,
-        )
-        page_indices[:, :, num_pages_to_select].fill_(last_page_idx)
-    page_indices[:, :, :num_pages_to_select].copy_(top_k_page_indices)
-
-    if cache_seqlens.dim() == 1:
-        cache_seqlens = cache_seqlens[:, None].expand(batch, num_kv_heads)
-    else:
-        assert cache_seqlens.shape == (batch, num_kv_heads), "cache_seqlens must be [B, H_kv]"
-
-    if workspace is None and hasattr(kv_cache, "get_paged_decode_workspace"):
-        workspace = kv_cache.get_paged_decode_workspace(
-            batch, num_heads, head_dim, splits, 16, q.dtype, q.device
-        )
-
-    _paged_kernel(
-        q=q,
-        k_cache=kv_cache.k_cache,
-        v_cache=kv_cache.v_cache,
-        out=out,
-        cache_seqlens=cache_seqlens,
-        page_indices=page_indices,
-        page_size=page_size,
-        alibi_slopes=alibi_slopes,
-        is_causal=True,
-        alpha=alpha,
-        niter=niter,
-        max_splits=splits,
-        q_seqlens=q_seqlens,
-        workspace=workspace,
-    )
-
+    q3, out3 = decode_views(q, out)
+    slopes = query_slopes(alibi_slopes, q.shape[1], q.device)
+    ps = kv_cache.page_size
+    if not all(topk_is_worthwhile(n, topk_pages, min_context, ps)
+               for n in kv_cache.seq_lens_host):
+        decode_exact(q3, kv_cache, alpha, slopes, niter, out3)
+        return out
+    if kv_cache.k_min is None:
+        raise ValueError("top-k decoding needs a cache built with 'topk' stats")
+    selector = workspace(kv_cache, ("topk", topk_pages),
+                         lambda: TopKPageSelector(topk_pages, ps))
+    sel = selector.select(q3, kv_cache.k_min, kv_cache.k_max,
+                          kv_cache.block_table, kv_cache.seq_lens, slopes,
+                          live_pages=kv_cache.live_pages)
+    decode_on_selection(q3, kv_cache, sel.pages, sel.sel_lens, alpha, slopes,
+                        niter, out3)
     return out

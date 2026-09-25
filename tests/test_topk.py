@@ -28,6 +28,9 @@ TOPK_COVERAGES = [0.25, 0.50]
 TOPK_ALPHAS = [1.5, 2.0]
 TOPK_DTYPES = [torch.float16, torch.float32]
 TOPK_DTYPE_IDS = ["fp16", "fp32"]
+# (kv_heads, q_heads): MHA, and GQA with 2 query heads per KV head.
+TOPK_HEADS = [(8, 8), (8, 16)]
+TOPK_HEAD_IDS = ["mha", "gqa"]
 
 
 # ---------------------------------------------------------------------------
@@ -56,8 +59,9 @@ def run_topk_benchmark(
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
     alibi = generate_alibi_slopes(q_heads) if use_alibi else None
-    page_budget = max(1, int((coverage * kv_len + page_size - 1) // page_size))
-    token_budget = page_budget * page_size
+    total_pages = (kv_len + 1 + page_size - 1) // page_size
+    # Budget in pages, tail inclusive.
+    topk_pages = max(2, round(coverage * total_pages))
 
     k_full = torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype).contiguous()
     v_full = torch.randn(batch, kv_heads, kv_len, head_dim, device=device, dtype=dtype).contiguous()
@@ -76,18 +80,11 @@ def run_topk_benchmark(
 
     out_ref = reference_attention(q, k_ref, v_ref, alpha=alpha, alibi_slopes=alibi)
 
-    full_seq_len = kv_len + 1
-    total_pages = (full_seq_len + page_size - 1) // page_size
-    num_pages_to_select = min(token_budget // page_size, total_pages - 1)
-    last_page_start = (total_pages - 1) * page_size
-    last_page_size = full_seq_len - last_page_start
-    effective_cache_len = num_pages_to_select * page_size + last_page_size
-    cache_seqlens = torch.full((batch,), effective_cache_len, device=device, dtype=torch.int32)
-    q_seqlens = torch.full((batch,), full_seq_len, device=device, dtype=torch.int32)
     out = torch.zeros_like(q)
 
     def make_fresh_cache():
-        c = PagedKVCache(page_size=page_size)
+        c = PagedKVCache(page_size=page_size, stats=("topk",),
+                         max_seq_len=kv_len + 1)
         c.initialize(k_full, v_full)
         c.append(k_new, v_new)
         return c
@@ -101,12 +98,9 @@ def run_topk_benchmark(
             k_new=k_new,
             v_new=v_new,
             out=out,
-            token_budget=token_budget,
-            cache_seqlens=cache_seqlens,
-            q_seqlens=q_seqlens,
+            topk_pages=topk_pages,
             alibi_slopes=alibi,
             alpha=alpha,
-            niter=2,
             append_cache=False,
         )
 
@@ -122,8 +116,7 @@ def run_topk_benchmark(
         "head_dim": head_dim,
         "page_size": page_size,
         "coverage": coverage,
-        "page_budget": page_budget,
-        "token_budget": token_budget,
+        "topk_pages": topk_pages,
         "alpha": alpha,
         "use_alibi": use_alibi,
         "dtype": dtype,
@@ -137,7 +130,7 @@ def run_topk_benchmark(
         dtype_str = "fp16" if dtype == torch.float16 else "fp32"
         tag = (
             f"[topk/paged] batch={batch} kv={kv_heads} q={q_heads} "
-            f"len={kv_len} coverage={coverage:.2f} budget={token_budget} "
+            f"len={kv_len} coverage={coverage:.2f} topk_pages={topk_pages} "
             f"alpha={alpha} alibi={use_alibi} dtype={dtype_str}"
         )
         print(
@@ -167,9 +160,10 @@ def _device():
 @pytest.mark.parametrize("batch", TOPK_BATCHES)
 @pytest.mark.parametrize("kv_len", TOPK_KV_LENS)
 @pytest.mark.parametrize("coverage", TOPK_COVERAGES)
-def test_topk_paged_basic(batch, kv_len, coverage, alpha, dtype):
+@pytest.mark.parametrize("heads", TOPK_HEADS, ids=TOPK_HEAD_IDS)
+def test_topk_paged_basic(batch, kv_len, coverage, alpha, dtype, heads):
     result = run_topk_benchmark(
-        seed=1, batch=batch, kv_heads=8, q_heads=8,
+        seed=1, batch=batch, kv_heads=heads[0], q_heads=heads[1],
         kv_len=kv_len, head_dim=64, page_size=16,
         coverage=coverage, alpha=alpha, use_alibi=False,
         dtype=dtype, device=_device(), print_results=False,
@@ -187,9 +181,10 @@ def test_topk_paged_basic(batch, kv_len, coverage, alpha, dtype):
 @pytest.mark.parametrize("batch", TOPK_BATCHES)
 @pytest.mark.parametrize("kv_len", TOPK_KV_LENS)
 @pytest.mark.parametrize("coverage", TOPK_COVERAGES)
-def test_topk_alibi(batch, kv_len, coverage, alpha, dtype):
+@pytest.mark.parametrize("heads", TOPK_HEADS, ids=TOPK_HEAD_IDS)
+def test_topk_alibi(batch, kv_len, coverage, alpha, dtype, heads):
     result = run_topk_benchmark(
-        seed=2, batch=batch, kv_heads=8, q_heads=8,
+        seed=2, batch=batch, kv_heads=heads[0], q_heads=heads[1],
         kv_len=kv_len, head_dim=64, page_size=16,
         coverage=coverage, alpha=alpha, use_alibi=True,
         dtype=dtype, device=_device(), print_results=False,

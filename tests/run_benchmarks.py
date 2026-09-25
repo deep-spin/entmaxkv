@@ -6,7 +6,7 @@ Times the attention entry points directly -- no reference, no error metrics.
     python tests/run_benchmarks.py topk
     python tests/run_benchmarks.py topk --kv-len 32768 --coverage 0.5
     python tests/run_benchmarks.py gaussian
-    python tests/run_benchmarks.py gaussian --clamp-tau
+    python tests/run_benchmarks.py gaussian --tau-mode fixed
 
 By default, sweeps kv_len over 32k/64k/128k and reports a timing table.
 Pass --kv-len explicitly to run a single length instead.
@@ -65,11 +65,12 @@ def build_inputs(args, device, dtype):
     k_new = torch.randn(b, h, 1, d, device=device, dtype=dtype).contiguous()
     v_new = torch.randn(b, h, 1, d, device=device, dtype=dtype).contiguous()
 
-    cache = PagedKVCache(page_size=args.page_size)
+    cache = PagedKVCache(page_size=args.page_size, stats=(args.kernel,),
+                         max_seq_len=n + 1)
     cache.initialize(k_full, v_full)
     cache.append(k_new, v_new)  # appended here; kernels run with append_cache=False
 
-    del k_full, v_full  # initialize() clones these
+    del k_full, v_full  # initialize() copies these into the paged pool
     torch.cuda.empty_cache()
 
     slopes = None
@@ -82,56 +83,44 @@ def build_inputs(args, device, dtype):
 def run_topk(args, device, dtype):
     q, k_new, v_new, cache, slopes = build_inputs(args, device, dtype)
 
-    page_size, kv_len = args.page_size, args.kv_len
-    page_budget = max(1, int((args.coverage * kv_len + page_size - 1) // page_size))
-    token_budget = page_budget * page_size
-
-    full_seq_len = kv_len + 1
-    total_pages = (full_seq_len + page_size - 1) // page_size
-    n_select = min(token_budget // page_size, total_pages - 1)
-    last_page_start = (total_pages - 1) * page_size
-    effective_len = n_select * page_size + (full_seq_len - last_page_start)
-
-    cache_seqlens = torch.full((args.batch,), effective_len, device=device, dtype=torch.int32)
-    q_seqlens = torch.full((args.batch,), full_seq_len, device=device, dtype=torch.int32)
+    total_pages = cache.live_pages
+    # Budget in pages, tail inclusive.
+    topk_pages = max(2, round(args.coverage * total_pages))
     out = torch.zeros_like(q)
 
     def call():
         sparse_attention_decode_paged(
             q=q, kv_cache=cache, k_new=k_new, v_new=v_new, out=out,
-            token_budget=token_budget, cache_seqlens=cache_seqlens,
-            q_seqlens=q_seqlens, alibi_slopes=slopes, alpha=args.alpha,
+            topk_pages=topk_pages, alibi_slopes=slopes, alpha=args.alpha,
             niter=args.niter, append_cache=False,
         )
 
-    print(f"coverage={args.coverage}  token_budget={token_budget}  "
-          f"pages={n_select}/{total_pages}")
+    print(f"coverage={args.coverage}  topk_pages={topk_pages}/{total_pages}")
     call()  # surface errors before timing
     return time_kernel(call, args.warmup, args.iters)
 
 
 def run_gaussian(args, device, dtype):
     q, k_new, v_new, cache, slopes = build_inputs(args, device, dtype)
-    q_seqlens = torch.full((args.batch,), args.kv_len + 1, device=device, dtype=torch.int32)
     out = torch.zeros_like(q)
+    niter = 3 if args.niter is None else args.niter
 
     def call():
         sparse_attention_decode_gaussian_aware_entmax(
             q=q, kv_cache=cache, k_new=k_new, v_new=v_new, out=out,
             alpha=args.alpha, safety_margin_z=args.safety_margin_z,
             max_quantile=args.max_quantile, alibi_slopes=slopes,
-            append_cache=False, tau_mode=args.tau_mode, q_seqlens=q_seqlens,
-            clamp_tau=args.clamp_tau,
+            niter=niter, append_cache=False, tau_mode=args.tau_mode,
         )
 
-    print(f"tau_mode={args.tau_mode}  clamp_tau={args.clamp_tau}")
+    print(f"tau_mode={args.tau_mode}  niter={niter}")
     call()
 
-    sel = cache.last_num_selected_per_head
-    if sel is not None:
-        total_pages = (args.kv_len + 1 + args.page_size - 1) // args.page_size
-        print(f"selected pages: mean={sel.float().mean():.1f} max={sel.max()} "
-              f"of {total_pages}")
+    selector = next(v for key, v in cache.workspaces.items()
+                    if isinstance(key, tuple) and key[0] == "gaussian")
+    sel = next(iter(selector._cache.values()))["page_counts"]
+    print(f"selected pages: mean={sel.float().mean():.1f} max={sel.max()} "
+          f"of {cache.live_pages}")
 
     return time_kernel(call, args.warmup, args.iters)
 
@@ -146,12 +135,11 @@ def main():
     p.add_argument("--coverage", type=float, default=0.25, help="topk only")
     p.add_argument("--tau-mode", default="corrected",
                    choices=["exact", "fixed", "corrected"], help="gaussian only")
-    p.add_argument("--clamp-tau", action="store_true",
-                   help="gaussian only; off by default. No effect when tau_mode=exact.")
     p.add_argument("--safety-margin-z", type=float, default=0.0)
     p.add_argument("--max-quantile", type=float, default=0.995)
     p.add_argument("--alpha", type=float, default=1.5)
-    p.add_argument("--niter", type=int, default=2)
+    p.add_argument("--niter", type=int, default=None,
+                   help="tau refinements (default: kernel default)")
     p.add_argument("--alibi", action="store_true")
     p.add_argument("--dtype", default="fp16", choices=list(DTYPES))
     p.add_argument("--kv-heads", type=int, default=8)
@@ -169,9 +157,6 @@ def main():
 
     device = torch.device("cuda")
     dtype = DTYPES[args.dtype]
-
-    if args.clamp_tau and args.tau_mode == "exact":
-        print("note: --clamp-tau is ignored when tau_mode=exact")
 
     kv_lens = [args.kv_len] if args.kv_len is not None else [32 * 1024, 64 * 1024, 128 * 1024]
     run_fn = run_topk if args.kernel == "topk" else run_gaussian
