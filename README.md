@@ -132,7 +132,7 @@ uv run python tests/run_benchmarks.py gaussian
 
 ## Efficiency
 
-![Decode-step wall-clock time across context lengths, normalized to Softmax Flash](assets/global_efficiency_optimized.png)
+![Decode-step wall-clock time across context lengths, normalized to Softmax Flash](assets/global_efficiency_h200.png)
 
 
 ## Citation
